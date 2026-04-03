@@ -1,0 +1,9 @@
+torch>=2.0
+torchvision>=0.15
+transformers>=4.30
+decord
+Pillow
+numpy
+pandas
+gradio
+huggingface_hub
