@@ -32,7 +32,7 @@ print(f"Device: {device}")
 # ====================== State ======================
 
 S = {"model": None, "cfg": None, "results": {}, "cur": None, "vr": None,
-     "done": [], "idx": 0,
+     "done": [], "idx": 0, "_active_vdir": None,
      "_cursor_data": json.dumps({"T": 0, "names": [], "labels": []}),
      "model_source": None, "disabled_classes": set()}
 
@@ -180,40 +180,70 @@ def on_toggle_change(enabled_behaviors):
 DEMO_LOCAL_DIR = os.path.join(os.path.expanduser("~"), "demo_data")
 
 def load_demo_inference(repo):
-    """Download all files from HF repo demo/ folder, only use videos for inference."""
+    """Download all files from HF demo/, scan videos, preview first one.
+    Does NOT modify the video folder path textbox."""
     if not repo:
-        return gr.update(choices=[], value=None), "❌ Specify repo", ""
+        return gr.update(choices=[], value=None), "❌ Specify repo", None, "<p style='color:#aaa;'>Select a video</p>", gr.update(maximum=0, value=0), "", S["_cursor_data"]
     try:
         all_files = list_repo_files(repo)
         demo_files = [f for f in all_files if f.startswith("demo/") and f != "demo/"]
         if not demo_files:
-            return gr.update(choices=[], value=None), "❌ No files in demo/ folder", ""
+            return gr.update(choices=[], value=None), "❌ No files in demo/ folder", None, "", gr.update(maximum=0, value=0), "", S["_cursor_data"]
         os.makedirs(DEMO_LOCAL_DIR, exist_ok=True)
-        downloaded = []
         for f in demo_files:
             local = hf_hub_download(repo_id=repo, filename=f)
             fname = os.path.basename(f)
             dest = os.path.join(DEMO_LOCAL_DIR, fname)
             if not os.path.exists(dest) or os.path.getsize(dest) != os.path.getsize(local):
                 import shutil; shutil.copy2(local, dest)
-            downloaded.append(fname)
-        # For inference: only list video files
-        videos = sorted([f for f in downloaded if f.lower().endswith((".mp4", ".avi", ".mov"))])
+        # Scan for videos
+        videos = sorted([f for f in os.listdir(DEMO_LOCAL_DIR) if f.lower().endswith((".mp4", ".avi", ".mov"))])
         if not videos:
-            return gr.update(choices=[], value=None), f"⚠️ Downloaded {len(downloaded)} file(s) but no videos found", DEMO_LOCAL_DIR
-        return (gr.update(choices=videos, value=videos[0]),
-                f"✅ Demo loaded: {len(videos)} video(s) from {len(downloaded)} file(s)",
-                DEMO_LOCAL_DIR)
+            return gr.update(choices=[], value=None), "⚠️ No videos in demo/", None, "", gr.update(maximum=0, value=0), "", S["_cursor_data"]
+        # Store active dir in state
+        S["_active_vdir"] = DEMO_LOCAL_DIR
+        # Preview first video
+        vf = videos[0]
+        vp = os.path.join(DEMO_LOCAL_DIR, vf)
+        try:
+            vr = VideoReader(vp, ctx=cpu(0))
+            S["_preview_vr"] = vr; S["_preview_vf"] = vf
+            T = len(vr); fps = vr.get_avg_fps()
+            info = (f"<div style='display:flex;justify-content:space-between;align-items:center;'>"
+                    f"<span style='padding:4px 12px;border-radius:6px;background:rgba(180,180,180,0.7);color:white;font-size:13px;font-weight:600;'>Preview</span>"
+                    f"<span style='font-size:12px;color:#666;'>F: 0/{T} | 0.00s/{T/fps:.2f}s</span></div>")
+            img = vr[0].asnumpy()
+        except:
+            T = 0; info = ""; img = None
+        return (gr.update(choices=videos, value=vf),
+                f"✅ Demo loaded: {len(videos)} video(s)",
+                img, info, gr.update(maximum=max(T - 1, 0), value=0), "", S["_cursor_data"])
     except Exception as e:
-        return gr.update(choices=[], value=None), f"❌ {e}", ""
+        return gr.update(choices=[], value=None), f"❌ {e}", None, "", gr.update(maximum=0, value=0), "", S["_cursor_data"]
 
-def scan_videos(vdir):
+def scan_videos_and_preview(vdir):
+    """Load folder: scan videos and preview the first one."""
     if not vdir or not os.path.isdir(vdir):
-        return gr.update(choices=[], value=None), "❌ Not found"
+        return gr.update(choices=[], value=None), "❌ Not found", None, "", gr.update(maximum=0, value=0), "", S["_cursor_data"]
     v = sorted([f for f in os.listdir(vdir) if f.lower().endswith((".mp4", ".avi", ".mov"))])
     if not v:
-        return gr.update(choices=[], value=None), "❌ No videos"
-    return gr.update(choices=v, value=v[0]), f"✅ {len(v)} videos"
+        return gr.update(choices=[], value=None), "❌ No videos", None, "", gr.update(maximum=0, value=0), "", S["_cursor_data"]
+    S["_active_vdir"] = vdir
+    # Preview first video
+    vf = v[0]
+    vp = os.path.join(vdir, vf)
+    try:
+        vr = VideoReader(vp, ctx=cpu(0))
+        S["_preview_vr"] = vr; S["_preview_vf"] = vf
+        T = len(vr); fps = vr.get_avg_fps()
+        info = (f"<div style='display:flex;justify-content:space-between;align-items:center;'>"
+                f"<span style='padding:4px 12px;border-radius:6px;background:rgba(180,180,180,0.7);color:white;font-size:13px;font-weight:600;'>Preview</span>"
+                f"<span style='font-size:12px;color:#666;'>F: 0/{T} | 0.00s/{T/fps:.2f}s</span></div>")
+        img = vr[0].asnumpy()
+    except:
+        T = 0; info = ""; img = None
+    return (gr.update(choices=v, value=vf), f"✅ {len(v)} videos",
+            img, info, gr.update(maximum=max(T - 1, 0), value=0), "", S["_cursor_data"])
 
 # ====================== HTML Builders ======================
 
@@ -357,8 +387,13 @@ def preview_info_html(vdir, vf, fi):
     except:
         return "<p style='color:#aaa;'>Cannot read video</p>"
 
-def on_video_select(vdir, vf):
+def _vdir(vdir_input):
+    """Return active video dir: prefer S state (set by demo/load), fallback to textbox."""
+    return S.get("_active_vdir") or vdir_input
+
+def on_video_select(vf):
     """When user selects a video from dropdown, show first frame + set scrubber."""
+    vdir = S.get("_active_vdir")
     if not vf or not vdir:
         return None, "<p style='color:#aaa;'>Select a video</p>", gr.update(maximum=0, value=0), "", S["_cursor_data"]
     # If we have inference results for this video, show full view
@@ -425,9 +460,10 @@ def _full(vf, fi=0, vd=0, vt=0):
 
 # ====================== Actions ======================
 
-def run_single(vdir, vf):
+def run_single(vf):
+    vdir = S.get("_active_vdir")
     if not S["model"]: yield "", "", None, "", "", "", "❌ Load model first", U, S["_cursor_data"]; return
-    if not vf: yield "", "", None, "", "", "", "❌ Select video", U, S["_cursor_data"]; return
+    if not vf or not vdir: yield "", "", None, "", "", "", "❌ Select video", U, S["_cursor_data"]; return
     result = None
     for msg in infer_video_gen(vdir, vf, S["model"], S["cfg"], S["disabled_classes"]):
         if isinstance(msg, dict): result = msg
@@ -438,9 +474,10 @@ def run_single(vdir, vf):
     if vf not in S["done"]: S["done"].append(vf)
     yield _full(vf, 0, 1, 1)
 
-def run_batch(vdir):
+def run_batch():
+    vdir = S.get("_active_vdir")
     if not S["model"]: yield "", "", None, "", "", "", "❌ Load model first", U, S["_cursor_data"], ""; return
-    if not vdir or not os.path.isdir(vdir): yield "", "", None, "", "", "", "❌ Dir not found", U, S["_cursor_data"], ""; return
+    if not vdir or not os.path.isdir(vdir): yield "", "", None, "", "", "", "❌ Load videos first", U, S["_cursor_data"], ""; return
     vids = sorted([f for f in os.listdir(vdir) if f.lower().endswith((".mp4", ".avi", ".mov"))])
     if not vids: yield "", "", None, "", "", "", "❌ No videos", U, S["_cursor_data"], ""; return
     total = len(vids); blog = []
@@ -464,14 +501,15 @@ def run_batch(vdir):
                nav_md(), gr.update(maximum=max(T - 1, 0), value=0),
                S["_cursor_data"], "\n".join(blog))
 
-def on_scrub(fi, vdir, vf_sel):
+def on_scrub(fi):
     fi = int(fi)
+    vdir = S.get("_active_vdir")
     vf = S["cur"]
     # If inference results exist, use them
     if vf and vf in S["results"]:
         return get_frame(vf, fi), frame_info_html(vf, fi)
     # Otherwise, preview mode — use the currently selected video
-    preview_vf = vf_sel or S.get("_preview_vf")
+    preview_vf = S.get("_preview_vf")
     if preview_vf and vdir:
         return preview_frame(vdir, preview_vf, fi), preview_info_html(vdir, preview_vf, fi)
     return None, "<p style='color:#aaa;'>Select a video to preview</p>"
@@ -513,7 +551,7 @@ def do_export_cur(vf, od, fmt):
     if not vf: return "❌"
     return _exp_onehot(vf, od) if fmt == "One-hot CSV (per-frame)" else _exp_boris(vf, od)
 
-def do_export_all(vdir, od, fmt):
+def do_export_all(od, fmt):
     if not S["done"]: return "❌"
     return "\n".join(_exp_onehot(v, od) if fmt == "One-hot CSV (per-frame)" else _exp_boris(v, od) for v in S["done"])
 
@@ -604,24 +642,27 @@ with gr.Blocks(title="Animal Behavior Inference", theme=GREEN_THEME) as demo:
     local_scan_btn.click(scan_local_models, [local_dir_in], [local_model_dd, model_st])
     local_load_btn.click(load_model_local, [local_dir_in, local_model_dd], [model_st, behavior_toggles, toggle_label_html])
     behavior_toggles.change(on_toggle_change, [behavior_toggles], [toggle_status])
-    demo_btn.click(load_demo_inference, [repo_in], [video_dd, scan_st, vdir_in])
-    load_folder_btn.click(scan_videos, [vdir_in], [video_dd, scan_st])
+
+    # Shared outputs for demo/load folder: video dropdown, status, preview frame, info, scrubber, timeline, cursor
+    load_outputs = [video_dd, scan_st, frame_img, info_html, scrubber, timeline_html, cursor_state]
+    demo_btn.click(load_demo_inference, [repo_in], load_outputs)
+    load_folder_btn.click(scan_videos_and_preview, [vdir_in], load_outputs)
 
     # Video selection triggers preview (frame + scrubber setup)
-    video_dd.change(on_video_select, [vdir_in, video_dd], [frame_img, info_html, scrubber, timeline_html, cursor_state])
+    video_dd.change(on_video_select, [video_dd], [frame_img, info_html, scrubber, timeline_html, cursor_state])
 
     out9 = [batch_prog, info_html, frame_img, timeline_html, behavior_html, exp_prev, nav_md_out, scrubber, cursor_state]
     out10 = out9 + [batch_log_tb]
 
-    run_btn.click(run_single, [vdir_in, video_dd], out9)
-    batch_btn.click(run_batch, [vdir_in], out10)
+    run_btn.click(run_single, [video_dd], out9)
+    batch_btn.click(run_batch, [], out10)
     scrubber.input(fn=None, inputs=[scrubber, cursor_state], outputs=[scrubber], js=CURSOR_JS)
-    scrubber.change(on_scrub, inputs=[scrubber, vdir_in, video_dd], outputs=[frame_img, info_html])
+    scrubber.change(on_scrub, inputs=[scrubber], outputs=[frame_img, info_html])
     prev_btn.click(lambda: do_nav("prev"), [], out9)
     next_btn.click(lambda: do_nav("next"), [], out9)
     exp_fmt.change(update_export_preview, [exp_fmt], [exp_prev])
     exp_cur.click(do_export_cur, [video_dd, out_dir, exp_fmt], [exp_log])
-    exp_all.click(do_export_all, [vdir_in, out_dir, exp_fmt], [exp_log])
+    exp_all.click(do_export_all, [out_dir, exp_fmt], [exp_log])
 
 if __name__ == "__main__":
     demo.launch(debug=True, share=True)
