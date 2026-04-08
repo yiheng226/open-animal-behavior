@@ -383,7 +383,7 @@ def compute_label_map_from_dropdowns(mode, dd_values, data_labels, pretrained_na
     new_names follows CSV column order for consistency with test code."""
     N = len(data_labels)
 
-    if mode == "Pretrain head":
+    if mode == "Pretrain head" and pretrained_names:
         mapping = {}
         other_list = []
         exclude_list = []
@@ -677,7 +677,7 @@ def on_mapping_change(head_mode, *dd_vals):
     # Parse current values
     cur_vals = list(dd_vals[:N])
 
-    if head_mode == "Pretrain head":
+    if head_mode == "Pretrain head" and pretrained_names:
         # Pretrain: choices are static, no need to rebuild
         dd_updates = []
         for i in range(N):
@@ -974,31 +974,32 @@ YELLOW_THEME = gr.themes.Soft(primary_hue=gr.themes.colors.amber, secondary_hue=
 
 DEMO_LOCAL_DIR = os.path.join(os.path.expanduser("~"), "demo_data")
 
-def load_demo_training(repo):
-    """Download ALL files from HF repo demo/ folder into a local dir.
-    Sets both video dir and label dir to the same folder (scan matches by filename)."""
+def load_demo_training(repo, val_pct, val_seed, head_mode, *dd_vals):
+    """Download ALL files from HF repo demo/ folder, then auto-scan.
+    Returns same outputs as do_scan_and_preview so everything loads in one click."""
+    N = MAX_LABELS
+    empty = lambda msg: (msg, "", "*Load data first*",
+                         *[gr.update(visible=False, choices=[], value=None) for _ in range(N)],
+                         gr.update(choices=[], value=None),
+                         None, "", "", gr.update(maximum=0, value=0), S["_cursor_data"], "", "")
     if not repo:
-        return "❌ Specify repo", "", ""
+        return empty("❌ Specify repo")
     try:
         all_files = list_repo_files(repo)
         demo_files = [f for f in all_files if f.startswith("demo/") and f != "demo/"]
         if not demo_files:
-            return "❌ No files in demo/ folder on HuggingFace", "", ""
+            return empty("❌ No files in demo/ folder on HuggingFace")
         os.makedirs(DEMO_LOCAL_DIR, exist_ok=True)
-        downloaded = []
         for f in demo_files:
             local = hf_hub_download(repo_id=repo, filename=f)
             fname = os.path.basename(f)
             dest = os.path.join(DEMO_LOCAL_DIR, fname)
             if not os.path.exists(dest) or os.path.getsize(dest) != os.path.getsize(local):
                 shutil.copy2(local, dest)
-            downloaded.append(fname)
-        n_vid = len([f for f in downloaded if f.lower().endswith((".mp4", ".avi", ".mov"))])
-        n_csv = len([f for f in downloaded if f.lower().endswith(".csv")])
-        return (f"✅ Demo loaded: {len(downloaded)} file(s) ({n_vid} video, {n_csv} csv)",
-                DEMO_LOCAL_DIR, DEMO_LOCAL_DIR)
+        # Now run the same scan logic with demo dir
+        return do_scan_and_preview(DEMO_LOCAL_DIR, DEMO_LOCAL_DIR, val_pct, val_seed, head_mode, *dd_vals)
     except Exception as e:
-        return f"❌ {e}", "", ""
+        return empty(f"❌ {e}")
 
 # ====================== GUI ======================
 
@@ -1085,12 +1086,14 @@ with gr.Blocks(title="Training", theme=YELLOW_THEME) as demo:
     demo.load(list_models,[repo_in],[model_dd,model_st])
     load_btn.click(load_pretrained,[repo_in,model_dd],[model_st])
 
-    # Demo button → download from HF and fill paths
-    demo_btn.click(load_demo_training,[repo_in],[scan_st,vdir_in,ldir_in])
-
     # Scan outputs: status, dist, nav, N dropdown updates, vid_dd, img, info, tl, scrubber, cursor, vid_list, summary
     scan_outputs = [scan_st, label_dist_html, nav_md, *map_dds, vid_dd,
                     frame_img, info_html, timeline_html, scrubber, cursor_state, vid_list_html, mapping_summary]
+
+    # Demo button → download from HF + auto-scan (same outputs as Load folder, paths stay untouched)
+    demo_btn.click(load_demo_training, [repo_in, vr_in, val_seed_in, head_mode_dd, *map_dds], scan_outputs)
+
+    # Load folder → scan user's own directories
     scan_d.click(do_scan_and_preview, [vdir_in, ldir_in, vr_in, val_seed_in, head_mode_dd, *map_dds], scan_outputs)
 
     # Head mode change → rebuild all mapping dropdowns + timeline + summary
