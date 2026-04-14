@@ -338,7 +338,10 @@ def list_models(repo):
     return gr.update(choices=names, value=names[0] if names else None), msg
 
 def load_pretrained(repo, mname):
-    if not mname: return "❌ Select a model first"
+    """Returns (status_text, window_update) — window slider auto-syncs to
+    the backbone's native num_frames so temporal weights align with pretrain."""
+    if not mname:
+        return "❌ Select a model first", gr.update()
     try:
         # ----- Built-in path: build fresh from local torchvision / HF cache -----
         if mname in BUILTIN_MODELS:
@@ -356,21 +359,29 @@ def load_pretrained(repo, mname):
             cfg["num_classes"] = 0
             cfg["class_names"] = []
             S.update({"model": model, "cfg": cfg, "train_log": []})
+            nf = cfg["backbone"]["num_frames"]
             return (f"✅ Loaded: {mname}\n"
                     f"  Backbone: {cfg['backbone']['name']}\n"
+                    f"  Window auto-set to {nf} frames\n"
                     f"  No pretrained head — use 'New head' mode\n"
-                    f"  Device: {device}")
+                    f"  Device: {device}"), gr.update(value=nf)
 
         # ----- HF repo path (existing behaviour) -----
-        if not repo: return "❌ Specify repo for HF model"
+        if not repo:
+            return "❌ Specify repo for HF model", gr.update()
         if not mname.endswith(".pth"): cf=f"{mname}/config.json"; pf=f"{mname}/model.pth"
         else: cf="config.json"; pf=mname
         with open(hf_hub_download(repo_id=repo,filename=cf)) as f: cfg=json.load(f)
         model=build_model(cfg)
         model.load_state_dict(torch.load(hf_hub_download(repo_id=repo,filename=pf),map_location=device,weights_only=True))
         model.to(device); S.update({"model":model,"cfg":cfg,"train_log":[]})
-        return f"✅ Loaded: {mname}\n  Backbone: {cfg['backbone']['name']}\n  Classes: {cfg['class_names']}\n  Device: {device}"
-    except Exception as e: traceback.print_exc(); return f"❌ {e}"
+        nf = cfg["backbone"].get("num_frames", 16)
+        return (f"✅ Loaded: {mname}\n  Backbone: {cfg['backbone']['name']}\n"
+                f"  Classes: {cfg['class_names']}\n  Window auto-set to {nf} frames\n"
+                f"  Device: {device}"), gr.update(value=nf)
+    except Exception as e:
+        traceback.print_exc()
+        return f"❌ {e}", gr.update()
 
 # ====================== Train/Val Split ======================
 
@@ -1161,7 +1172,7 @@ with gr.Blocks(title="Training", theme=YELLOW_THEME) as demo:
     # ===== WIRING =====
 
     demo.load(list_models,[repo_in],[model_dd,model_st])
-    load_btn.click(load_pretrained,[repo_in,model_dd],[model_st])
+    load_btn.click(load_pretrained,[repo_in,model_dd],[model_st,ws_in])
 
     # Scan outputs: status, dist, nav, N dropdown updates, vid_dd, img, info, tl, scrubber, cursor, vid_list, summary
     scan_outputs = [scan_st, label_dist_html, nav_md, *map_dds, vid_dd,
