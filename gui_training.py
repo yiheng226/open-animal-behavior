@@ -1,603 +1,1361 @@
-"""
-Gradio GUI for animal behavior inference.
+# @title gui (with BORIS label support)
 
-Usage:
-    python gui_inference.py
-"""
+# ==================== 👇 修改這裡 👇 ====================
+HF_REPO_ID = "yiheng266/animal-social-models"
+DEFAULT_VIDEO_DIR = "/content/drive/My Drive/traindata/kuo_validation/video(s and g)/video/train"
+DEFAULT_LABEL_DIR = "/content/drive/My Drive/traindata/kuo_validation/video(s and g)/onehot"
+DEFAULT_OUTPUT_DIR = "/content/drive/My Drive/trained_models/"
+MAX_LABELS = 15  # pre-built dropdown slots
+# ==================== 👆 修改以上即可 👆 ====================
 
-import os, json, time, shutil
-import numpy as np
-import torch
-import gradio as gr
-import pandas as pd
-from PIL import Image
+import os, json, numpy as np, torch, torch.nn as nn, torch.optim as optim
+import gradio as gr, pandas as pd, random, shutil, time, traceback
+from PIL import Image, ImageFilter
+from torchvision.transforms import ToTensor
 from collections import Counter
 from decord import VideoReader, cpu
 from huggingface_hub import hf_hub_download, list_repo_files
-
-from models import build_model_from_config
-from config_utils import normalize_config, find_config_for_pth
-from inference import preprocess, infer_video_gen, remap_with_disabled, get_others_idx
-
-# ==================== 👇 修改這裡 👇 ====================
-HF_REPO_ID         = "yiheng266/animal-social-models"
-DEFAULT_VIDEO_DIR  = "/content/drive/My Drive/videos/"
-DEFAULT_OUTPUT_DIR = "/content/drive/My Drive/results/"
-DEFAULT_LOCAL_MODEL_DIRS = []
-# ==================== 👆 修改以上即可 👆 ====================
+from torch.utils.data import Dataset, DataLoader
+# GradScaler / autocast: the new torch.amp API (device-aware) replaces the deprecated
+# torch.cuda.amp API in PyTorch 2.3+. Fall back to the old one on older versions.
+try:
+    from torch.amp import GradScaler as _GradScaler, autocast as _autocast
+    def GradScaler(): return _GradScaler("cuda")
+    def autocast(): return _autocast("cuda")
+except ImportError:
+    from torch.cuda.amp import GradScaler, autocast  # pragma: no cover
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from sklearn.metrics import f1_score, average_precision_score, precision_score, recall_score
+from sklearn.model_selection import train_test_split
+from difflib import SequenceMatcher
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
 
+# ====================== Google Drive Mount Check ======================
+
+def ensure_drive_mounted():
+    if os.path.exists("/content") and not os.path.exists("/content/drive/My Drive"):
+        try:
+            from google.colab import drive
+            drive.mount("/content/drive")
+            print("✅ Google Drive mounted.")
+        except Exception as e:
+            print(f"⚠️ Could not mount Google Drive: {e}")
+    elif os.path.exists("/content/drive/My Drive"):
+        print("✅ Google Drive already mounted.")
+    else:
+        print("ℹ️ Not running in Colab — skipping Drive mount.")
+
+ensure_drive_mounted()
+
+# ====================== Models ======================
+
+class MLPHead_CLS(nn.Module):
+    def __init__(self, inf, nc, hd, dr):
+        super().__init__()
+        self.norm=nn.LayerNorm(inf); self.fc1=nn.Linear(inf,hd)
+        self.relu=nn.ReLU(True); self.drop=nn.Dropout(dr); self.fc2=nn.Linear(hd,nc)
+    def forward(self,x):
+        return self.fc2(self.drop(self.relu(self.fc1(self.norm(x)))))
+
+class MLPHead_TM(nn.Module):
+    def __init__(self, inf, nc, hd, dr):
+        super().__init__()
+        self.norm=nn.LayerNorm(inf); self.fc1=nn.Linear(inf,hd)
+        self.relu=nn.ReLU(True); self.drop=nn.Dropout(dr); self.fc2=nn.Linear(hd,nc)
+    def forward(self,x):
+        x=torch.mean(x,dim=1)
+        return self.fc2(self.drop(self.relu(self.fc1(self.norm(x)))))
+
+class CustomTimeSformer(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        from transformers import TimesformerModel
+        self.backbone=TimesformerModel.from_pretrained(cfg["backbone"]["pretrained"])
+        self.head=MLPHead_CLS(cfg["head"]["in_features"],cfg["num_classes"],cfg["head"]["hidden_dim"],cfg["head"]["dropout"])
+    def forward(self,x):
+        x=x.permute(0,2,1,3,4)
+        return self.head(self.backbone(pixel_values=x).last_hidden_state[:,0])
+
+class CustomSwin3D(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        from torchvision.models.video import swin3d_t, Swin3D_T_Weights
+        self.model=swin3d_t(weights=Swin3D_T_Weights.DEFAULT)
+        self.model.head=nn.Identity(); self.model.avgpool=nn.Identity()
+        self.head=MLPHead_TM(cfg["head"]["in_features"],cfg["num_classes"],cfg["head"]["hidden_dim"],cfg["head"]["dropout"])
+    def forward(self,x):
+        x=self.model.patch_embed(x); x=self.model.pos_drop(x)
+        x=self.model.features(x); x=self.model.norm(x); x=x.mean(dim=(2,3))
+        return self.head(x)
+
+def build_model(cfg):
+    n=cfg["backbone"]["name"]
+    if n=="TimesformerModel": return CustomTimeSformer(cfg)
+    elif n=="CustomSwin3D": return CustomSwin3D(cfg)
+    else: raise ValueError(f"Unknown backbone: {n}")
+
+def rebuild_head(model, cfg, new_nc):
+    hd=cfg["head"]["hidden_dim"]; dr=cfg["head"]["dropout"]; inf=cfg["head"]["in_features"]
+    pool=cfg["head"].get("pool","cls_token")
+    if pool=="temporal_mean": model.head=MLPHead_TM(inf,new_nc,hd,dr)
+    else: model.head=MLPHead_CLS(inf,new_nc,hd,dr)
+    return model
+
+# ====================== Preprocess + Augmentation ======================
+
+def uniform_sample(frames,t):
+    n=len(frames)
+    if n==t: return frames
+    if n<t: return frames+[frames[-1]]*(t-n)
+    return [frames[i] for i in np.linspace(0,n-1,t,dtype=int)]
+
+def preprocess(frames,cfg,skip_resize=False):
+    """Convert PIL frames → normalized tensor (C, T, H, W).
+
+    If skip_resize=True, assumes frames are already at the target size (faster,
+    when augmentation has already resized them).
+    """
+    sz=cfg["backbone"]["input_size"]; nf=cfg["backbone"]["num_frames"]
+    m=cfg["input_format"]["normalize"]["mean"]; s=cfg["input_format"]["normalize"]["std"]
+    r=frames if skip_resize else [f.resize((sz,sz),Image.BILINEAR) for f in frames]
+    if len(r)!=nf: r=uniform_sample(r,nf)
+    v=torch.stack([ToTensor()(f) for f in r],0)
+    return ((v-torch.tensor(m).view(1,-1,1,1))/torch.tensor(s).view(1,-1,1,1)).permute(1,0,2,3)
+
+def random_blur(frames,frac=0.35,rng=None):
+    if frac<=0 or not frames: return frames
+    rng=rng or random; n=len(frames); k=max(1,int(round(n*frac))); idxs=rng.sample(range(n),k)
+    return [f.filter(ImageFilter.GaussianBlur(radius=rng.uniform(0.8,2.2))) if i in idxs else f for i,f in enumerate(frames)]
+
+def temporal_dropout(frames,frac=0.15,rng=None):
+    if frac<=0 or len(frames)<3: return frames
+    rng=rng or random; n=len(frames); k=max(1,int(round(n*frac)))
+    idxs=rng.sample(range(1,n-1),min(k,max(1,n-2))); out=frames[:]
+    for i in idxs: out[i]=out[i-1] if rng.random()<0.5 else out[i+1]
+    return out
+
+def horizontal_flip(frames,prob=0.5,rng=None):
+    """Roboflow-style horizontal flip. Applied to the whole window (all frames) consistently."""
+    if prob<=0 or not frames: return frames
+    rng=rng or random
+    if rng.random()<prob:
+        return [f.transpose(Image.FLIP_LEFT_RIGHT) for f in frames]
+    return frames
+
+def vertical_flip(frames,prob=0.5,rng=None):
+    """Roboflow-style vertical flip. Applied to the whole window (all frames) consistently."""
+    if prob<=0 or not frames: return frames
+    rng=rng or random
+    if rng.random()<prob:
+        return [f.transpose(Image.FLIP_TOP_BOTTOM) for f in frames]
+    return frames
+
+def random_rotation(frames,max_deg=0.0,rng=None):
+    """Rotate the whole window by the same random angle in [-max_deg, +max_deg]."""
+    if max_deg<=0 or not frames: return frames
+    rng=rng or random
+    ang=rng.uniform(-max_deg,max_deg)
+    if abs(ang)<0.1: return frames
+    return [f.rotate(ang,resample=Image.BILINEAR) for f in frames]
+
+def color_jitter(frames,brightness=0.0,contrast=0.0,saturation=0.0,rng=None):
+    """Roboflow-style brightness/contrast/saturation jitter. Same factor applied to every frame in the window."""
+    if not frames: return frames
+    if brightness<=0 and contrast<=0 and saturation<=0: return frames
+    from PIL import ImageEnhance
+    rng=rng or random
+    out=frames
+    if brightness>0:
+        f=1.0+rng.uniform(-brightness,brightness)
+        out=[ImageEnhance.Brightness(x).enhance(f) for x in out]
+    if contrast>0:
+        f=1.0+rng.uniform(-contrast,contrast)
+        out=[ImageEnhance.Contrast(x).enhance(f) for x in out]
+    if saturation>0:
+        f=1.0+rng.uniform(-saturation,saturation)
+        out=[ImageEnhance.Color(x).enhance(f) for x in out]
+    return out
+
+# ====================== BORIS Label Parsing ======================
+# BORIS export format: one row per START/STOP event.
+# Key columns: Behavior, Behavior type (START/STOP), Time (seconds), FPS.
+# Strategy: use actual video FPS from VideoReader (most accurate),
+#           fall back to BORIS CSV FPS column, then finally to int(csv_fps).
+# Image index column is intentionally ignored — it is often inaccurate.
+
+def is_boris_csv(lp):
+    """Return True if the CSV looks like a BORIS event export."""
+    try:
+        df = pd.read_csv(lp, nrows=2)
+        required = {"Behavior", "Behavior type", "Time"}
+        return required.issubset(set(df.columns))
+    except Exception:
+        return False
+
+
+def boris_to_onehot(lp, total_frames, video_fps):
+    """
+    Convert a BORIS CSV to a per-frame one-hot (multi-hot) numpy array.
+
+    Returns
+    -------
+    onehot : np.ndarray, shape (total_frames, n_behaviors + 1)
+        Last column is "Other" (1 when no behaviour is active).
+    behavior_names : list[str]
+        Column names in order, with "Other" appended last.
+
+    Notes
+    -----
+    - FPS priority: video_fps (from VideoReader) > BORIS 'FPS' column > fallback 25.
+    - Frame index = int(time_seconds * fps), clipped to [0, total_frames).
+    - START/STOP count mismatch for a behaviour → that behaviour is skipped with a warning.
+    - Overlapping behaviours are allowed (multi-hot).
+    """
+    df = pd.read_csv(lp)
+
+    # ---- resolve FPS ----
+    fps = video_fps  # prefer real video fps
+    if fps <= 0 and "FPS" in df.columns:
+        try:
+            fps_vals = pd.to_numeric(df["FPS"], errors="coerce").dropna()
+            if len(fps_vals) > 0:
+                fps = float(fps_vals.iloc[0])
+        except Exception:
+            pass
+    if fps <= 0:
+        fps = 25.0
+        print(f"⚠️  Could not determine FPS for {lp}, defaulting to 25")
+
+    # ---- collect unique behaviors (preserve CSV order) ----
+    all_behaviors = list(dict.fromkeys(df["Behavior"].dropna().tolist()))
+
+    n_beh = len(all_behaviors)
+    onehot = np.zeros((total_frames, n_beh), dtype=np.int8)
+
+    for bi, beh in enumerate(all_behaviors):
+        bdf = df[df["Behavior"] == beh]
+        starts = bdf[bdf["Behavior type"] == "START"]["Time"].values.astype(float)
+        stops  = bdf[bdf["Behavior type"] == "STOP"]["Time"].values.astype(float)
+
+        if len(starts) != len(stops):
+            print(f"⚠️  {beh}: START/STOP mismatch ({len(starts)}/{len(stops)}) — skipping")
+            continue
+
+        for t_start, t_stop in zip(starts, stops):
+            f_start = int(t_start * fps)
+            f_stop  = min(int(t_stop  * fps), total_frames)  # inclusive end → clip
+            if f_start >= total_frames:
+                continue
+            onehot[f_start:f_stop, bi] = 1
+
+    # ---- build "Other" column ----
+    other_col = (onehot.sum(axis=1) == 0).astype(np.int8).reshape(-1, 1)
+    onehot_full = np.concatenate([onehot, other_col], axis=1)
+    behavior_names = all_behaviors + ["Other"]
+
+    return onehot_full, behavior_names
+
+
+def align_onehot_to_global(oh, col_names, global_names):
+    """
+    Re-arrange a (T, n_local) onehot to match a global column order (T, n_global).
+    Columns present locally are copied to their global slot; missing columns are
+    filled with zeros. After realignment, frames where all behaviour columns are
+    zero are re-routed to the global "Other" column (so the file still
+    contributes valid labels even if it has fewer behaviours than the dataset).
+
+    This fixes the silent bug where np.argmax on an unaligned per-file onehot
+    points to the wrong class in the global namespace.
+    """
+    T = oh.shape[0]
+    n_global = len(global_names)
+    out = np.zeros((T, n_global), dtype=oh.dtype)
+
+    # Map each local column to its global index (if any)
+    for local_i, name in enumerate(col_names):
+        if name in global_names:
+            g = global_names.index(name)
+            out[:, g] = oh[:, local_i]
+        # else: this file has a behaviour the global set doesn't know — drop it
+
+    # If the global set has an "Other" column, make sure rows that are
+    # all-zero in the behaviour cols (i.e. "no behaviour active") still mark
+    # Other = 1, even if this file's local oh didn't have an Other column.
+    if "Other" in global_names:
+        other_g = global_names.index("Other")
+        # behaviour mask = global cols except Other
+        beh_mask = [i for i in range(n_global) if i != other_g]
+        if beh_mask:
+            no_beh = (out[:, beh_mask].sum(axis=1) == 0)
+            out[no_beh, other_g] = 1
+        else:
+            out[:, other_g] = 1
+    return out
+
+
+# In-memory cache: lp -> (onehot_array, behavior_names)
+# Avoids re-parsing on every window during training.
+_BORIS_CACHE: dict = {}
+
+
+def load_label_data(lp, total_frames, video_fps):
+    """
+    Unified label loader.  Returns (onehot_array, behavior_names).
+
+    - Standard one-hot CSV  → read directly with pandas.
+    - BORIS event CSV       → convert via boris_to_onehot() with caching.
+    """
+    if is_boris_csv(lp):
+        cache_key = (lp, total_frames, round(video_fps, 4))
+        if cache_key not in _BORIS_CACHE:
+            onehot, names = boris_to_onehot(lp, total_frames, video_fps)
+            _BORIS_CACHE[cache_key] = (onehot, names)
+        return _BORIS_CACHE[cache_key]
+    else:
+        # Original one-hot format
+        df = pd.read_csv(lp)
+        return df.values.astype(np.int8), list(df.columns)
+
+
+# ====================== Dataset ======================
+
+
+class SlidingWindowDataset(Dataset):
+    def __init__(self,video_paths,label_paths,ws,stride,cfg,nc,label_map,skip=0,augment=None):
+        self.cfg=cfg; self.ws=ws; self.augment=augment; self.samples=[]; self.sample_labels=[]
+        self._input_size=cfg["backbone"]["input_size"]  # cache for fast path
+        # Global label order from the scan stage. Per-file onehots will be
+        # realigned to this order so that argmax produces correct global indices.
+        global_names = S.get("label_names", []) or []
+        for vp,lp in zip(video_paths,label_paths):
+            try:
+                vr=VideoReader(vp,ctx=cpu(0)); T=len(vr); fps=vr.get_avg_fps()
+                del vr  # free decord's frame cache (see scan stage comment)
+
+                # ---- unified label loading (handles both BORIS and one-hot) ----
+                oh, col_names = load_label_data(lp, T, fps)
+                if global_names and col_names != global_names:
+                    oh = align_onehot_to_global(oh, col_names, global_names)
+
+                if T!=len(oh): print(f"⚠️ Length mismatch {vp}"); continue
+                raw=np.argmax(oh,axis=1); mapped=np.array([label_map.get(int(l),-1) for l in raw])
+                sel=list(range(0,T,skip+1)); valid=[i for i in sel if i<len(mapped) and mapped[i]>=0]
+                if len(valid)<ws: continue
+                for s in range(0,len(valid)-ws+1,stride):
+                    idx=valid[s:s+ws]; lbl=Counter(mapped[idx]).most_common(1)[0][0]
+                    self.samples.append((vp,idx,int(lbl))); self.sample_labels.append(int(lbl))
+            except Exception as e: print(f"⚠️ Skipped {vp}: {e}"); continue
+    def __len__(self): return len(self.samples)
+    def __getitem__(self,i):
+        vp,idx,lbl=self.samples[i]
+        # NOTE: we open a fresh VideoReader per call. A per-worker cache was tried
+        # but decord + torch DataLoader workers have known memory-accumulation issues
+        # (see dmlc/decord#280) — caching makes Colab OOM / workers crash silently.
+        vr=VideoReader(vp,ctx=cpu(0))
+        frames=[Image.fromarray(f) for f in vr.get_batch(idx).asnumpy()]
+        if len(frames)<self.ws: frames+=[frames[-1]]*(self.ws-len(frames))
+        # Resize EARLY — augmentation runs on 224x224 instead of e.g. 1920x1080.
+        # Rotation / color jitter / blur are ~50-70x faster at small resolution.
+        sz=self._input_size
+        frames=[f.resize((sz,sz),Image.BILINEAR) for f in frames]
+        if self.augment: frames=self.augment(frames)
+        return preprocess(frames,self.cfg,skip_resize=True),torch.tensor(lbl,dtype=torch.long)
+
+# ====================== State ======================
+
+S = {"model":None,"cfg":None,"scan_data":None,"label_names":[],"cur_vf":None,"cur_vr":None,
+     "_cursor_data":json.dumps({"T":0,"names":[],"labels":[]}),"train_log":[],"split_indices":{"train":[],"val":[]}}
+
+CLR_PAL=["#378ADD","#D85A30","#E24B4A","#7F77DD","#1D9E75","#BA7517",
+         "#534AB7","#993C1D","#639922","#D4537E","#185FA5","#854F0B","#A32D2D"]
+U=gr.update()
+
+def get_clr(i,name):
+    if name.lower() in ("other","others"): return "#FFFFFF","rgba(180,180,180,0.9)"
+    c=CLR_PAL[i%len(CLR_PAL)]; r,g,b=int(c[1:3],16),int(c[3:5],16),int(c[5:7],16)
+    return c,f"rgba({r},{g},{b},0.9)"
+
+# ====================== Model Management ======================
+
+# Built-in backbones — no HF repo download needed.
+# Weights are fetched from torchvision / huggingface-transformers cache the first
+# time the backbone class is instantiated, then reused from local cache.
+BUILTIN_MODELS = {
+    "[BUILTIN] Swin3D-T (K400)": {
+        "backbone": {
+            "name": "CustomSwin3D",
+            "source": "torchvision",
+            "pretrained": "Swin3D_T_Weights.DEFAULT",
+            "hidden_size": 768,
+            "num_frames": 16,
+            "input_size": 224,
+        },
+        "head": {
+            "type": "MLPHead", "in_features": 768, "hidden_dim": 512,
+            "dropout": 0.3, "activation": "ReLU", "norm": "LayerNorm",
+            "pool": "temporal_mean",
+        },
+        "num_classes": 0,
+        "class_names": [],
+        "input_format": {
+            "shape": "(B, C, T, H, W)", "C": 3, "T": 16, "H": 224, "W": 224,
+            "normalize": {"mean":[0.485,0.456,0.406],"std":[0.229,0.224,0.225]},
+        },
+    },
+    "[BUILTIN] TimeSformer-B (K400)": {
+        "backbone": {
+            "name": "TimesformerModel",
+            "source": "huggingface",
+            "pretrained": "facebook/timesformer-base-finetuned-k400",
+            "hidden_size": 768,
+            "num_frames": 8,
+            "input_size": 224,
+        },
+        "head": {
+            "type": "MLPHead", "in_features": 768, "hidden_dim": 512,
+            "dropout": 0.3, "activation": "ReLU", "norm": "LayerNorm",
+            "pool": "cls_token",
+        },
+        "num_classes": 0,
+        "class_names": [],
+        "input_format": {
+            "shape": "(B, C, T, H, W)", "C": 3, "T": 8, "H": 224, "W": 224,
+            "normalize": {"mean":[0.485,0.456,0.406],"std":[0.229,0.224,0.225]},
+        },
+    },
+}
+
+def list_models(repo):
+    builtin_names = list(BUILTIN_MODELS.keys())
+    hf_names = []
+    hf_err = None
+    try:
+        files = list_repo_files(repo)
+        pths = [f for f in files if f.endswith("/model.pth") or f == "model.pth"]
+        if not pths: pths = [f for f in files if f.endswith(".pth")]
+        hf_names = [os.path.dirname(p) if "/" in p else p for p in pths]
+    except Exception as e:
+        hf_err = str(e)
+    names = builtin_names + hf_names
+    msg = f"✅ {len(builtin_names)} builtin + {len(hf_names)} HF model(s)"
+    if hf_err: msg += f"  (HF list failed: {hf_err})"
+    return gr.update(choices=names, value=names[0] if names else None), msg
+
+def load_pretrained(repo, mname):
+    """Returns (status_text, window_update) — window slider auto-syncs to
+    the backbone's native num_frames so temporal weights align with pretrain."""
+    if not mname:
+        return "❌ Select a model first", gr.update()
+    try:
+        # ----- Built-in path: build fresh from local torchvision / HF cache -----
+        if mname in BUILTIN_MODELS:
+            import copy as _copy
+            cfg = _copy.deepcopy(BUILTIN_MODELS[mname])
+            # build_model needs a valid num_classes (>=1) to construct the head.
+            # We use a throwaway value of 1; rebuild_head() at train time will
+            # replace the head with the correct new_nc from the user's data.
+            cfg["num_classes"] = 1
+            model = build_model(cfg)
+            model.to(device)
+            # Clear class_names / num_classes so the GUI forces "New head" logic
+            # (compute_label_map_from_dropdowns falls back to new-head branch
+            # when pretrained_names is empty).
+            cfg["num_classes"] = 0
+            cfg["class_names"] = []
+            S.update({"model": model, "cfg": cfg, "train_log": []})
+            nf = cfg["backbone"]["num_frames"]
+            return (f"✅ Loaded: {mname}\n"
+                    f"  Backbone: {cfg['backbone']['name']}\n"
+                    f"  Window auto-set to {nf} frames\n"
+                    f"  No pretrained head — use 'New head' mode\n"
+                    f"  Device: {device}"), gr.update(value=nf)
+
+        # ----- HF repo path (existing behaviour) -----
+        if not repo:
+            return "❌ Specify repo for HF model", gr.update()
+        if not mname.endswith(".pth"): cf=f"{mname}/config.json"; pf=f"{mname}/model.pth"
+        else: cf="config.json"; pf=mname
+        with open(hf_hub_download(repo_id=repo,filename=cf)) as f: cfg=json.load(f)
+        model=build_model(cfg)
+        model.load_state_dict(torch.load(hf_hub_download(repo_id=repo,filename=pf),map_location=device,weights_only=True))
+        model.to(device); S.update({"model":model,"cfg":cfg,"train_log":[]})
+        nf = cfg["backbone"].get("num_frames", 16)
+        return (f"✅ Loaded: {mname}\n  Backbone: {cfg['backbone']['name']}\n"
+                f"  Classes: {cfg['class_names']}\n  Window auto-set to {nf} frames\n"
+                f"  Device: {device}"), gr.update(value=nf)
+    except Exception as e:
+        traceback.print_exc()
+        return f"❌ {e}", gr.update()
+
+# ====================== Train/Val Split ======================
+
+def compute_split(val_pct, seed=1337):
+    if not S["scan_data"]: S["split_indices"]={"train":[],"val":[]}; return
+    data=S["scan_data"]; n=len(data); val_ratio=val_pct/100.0
+    if val_ratio>0 and n>=4: tidx,vidx=train_test_split(list(range(n)),test_size=val_ratio,random_state=int(seed))
+    elif val_ratio>0 and n>=2: vidx=[n-1]; tidx=list(range(n-1))
+    else: tidx=list(range(n)); vidx=[]
+    S["split_indices"]={"train":tidx,"val":vidx}
+
+def build_video_list_html(active_vf=None):
+    if not S["scan_data"]: return "<p style='color:#aaa;font-size:12px;'>Load data first</p>"
+    data=S["scan_data"]; tidx_set=set(S["split_indices"].get("train",[])); vidx_set=set(S["split_indices"].get("val",[]))
+    html="<div style='max-height:200px;overflow-y:auto;border:1px solid var(--color-border-secondary);border-radius:8px;padding:4px;'>"
+    for i,d in enumerate(data):
+        vf=d["vf"]; T=d["T"]; fps=d["fps"]; dur=T/fps if fps>0 else 0
+        fmt_tag = "<span style='font-size:10px;padding:1px 5px;border-radius:3px;background:#EDE9FE;color:#5B21B6;font-weight:600;margin-left:4px;'>BORIS</span>" if d.get("is_boris") else ""
+        is_active=(vf==active_vf); is_val=(i in vidx_set)
+        bg="background:rgba(220,38,38,0.12);border-left:3px solid #dc2626;" if is_active else "background:transparent;border-left:3px solid transparent;"
+        if is_val: role_tag="<span style='font-size:10px;padding:1px 5px;border-radius:3px;background:#FEF3C7;color:#92400E;font-weight:600;margin-left:6px;'>VAL</span>"
+        elif i in tidx_set: role_tag="<span style='font-size:10px;padding:1px 5px;border-radius:3px;background:#D1FAE5;color:#065F46;font-weight:600;margin-left:6px;'>TRAIN</span>"
+        else: role_tag=""
+        nc="#dc2626" if is_active else "var(--color-text-primary)"; nw="700" if is_active else "500"
+        html+=f"<div style='{bg}border-radius:4px;padding:4px 8px;margin-bottom:1px;'><div style='display:flex;justify-content:space-between;align-items:center;'><span style='font-size:12px;color:{nc};font-weight:{nw};'>{vf}{fmt_tag}{role_tag}</span><span style='font-size:10px;color:var(--color-text-secondary);white-space:nowrap;'>{T} fr · {dur:.1f}s</span></div></div>"
+    html+="</div>"
+    nt=len(tidx_set); nv=len(vidx_set)
+    html+=f"<div style='display:flex;gap:14px;margin-top:4px;font-size:11px;color:var(--color-text-secondary);'><span><span style='display:inline-block;width:8px;height:8px;border-radius:2px;background:#D1FAE5;border:1px solid #065F46;vertical-align:middle;margin-right:3px;'></span>Train: {nt}</span><span><span style='display:inline-block;width:8px;height:8px;border-radius:2px;background:#FEF3C7;border:1px solid #92400E;vertical-align:middle;margin-right:3px;'></span>Val: {nv}</span><span>Total: {len(data)}</span></div>"
+    return html
+
+# ====================== Label Mapping Logic ======================
+
+def fuzzy_match(data_name, pretrained_names):
+    """Find best fuzzy match for a data label among pretrained class names."""
+    dn = data_name.lower().replace("_"," ")
+    best_score, best_match = 0, None
+    for pn in pretrained_names:
+        pnl = pn.lower().replace("_"," ")
+        if dn == pnl: return pn  # exact
+        score = SequenceMatcher(None, dn, pnl).ratio()
+        # Also check substring containment
+        if dn in pnl or pnl in dn: score = max(score, 0.75)
+        if score > best_score: best_score = score; best_match = pn
+    return best_match if best_score >= 0.55 else None
+
+def build_mapping_choices_pt(idx, data_labels, pretrained_names):
+    """Pretrain head: choices = pretrained classes + Exclude (+ → Other only if no other/others in data)."""
+    has_other = any(n.lower() in ("other","others") for n in data_labels)
+    choices = list(pretrained_names)
+    if not has_other: choices.append("→ Other")
+    choices.append("→ Exclude")
+    # Default: fuzzy match or pretrained others
+    default = fuzzy_match(data_labels[idx], pretrained_names)
+    if default is None:
+        if "others" in pretrained_names: default = "others"
+        elif not has_other: default = "→ Other"
+        else: default = choices[0]
+    return choices, default
+
+def build_mapping_choices_new(idx, data_labels, all_mappings):
+    """New head: choices = keep / merge into available / (→ Other if needed) / Exclude."""
+    has_other = any(n.lower() in ("other","others") for n in data_labels)
+    consumed = set()
+    for i_str, val in all_mappings.items():
+        i = int(i_str)
+        if i == idx: continue
+        if val not in (None, "", "keep", "→ Other", "→ Exclude"): consumed.add(i)
+    choices = [f"{data_labels[idx]} (keep)"]
+    for j, nm in enumerate(data_labels):
+        if j == idx or j in consumed: continue
+        choices.append(f"→ merge into {nm}")
+    if not has_other: choices.append("→ Other")
+    choices.append("→ Exclude")
+    return choices
+
+def parse_mapping_value(val, data_labels):
+    """Parse a dropdown value to a mapping dict entry."""
+    if val is None or val == "" or "(keep)" in str(val): return "keep"
+    if "merge into" in str(val): return val
+    if val == "→ Other": return "→ Other"
+    if val == "→ Exclude": return "→ Exclude"
+    return val  # pretrain mode: val is a pretrained class name
+
+def compute_label_map_from_dropdowns(mode, dd_values, data_labels, pretrained_names):
+    """Convert dropdown values → (new_class_names, label_map{old_idx: new_idx or None}).
+    Excluded labels → None (frames skipped in training & evaluation).
+    new_names follows CSV column order for consistency with test code."""
+    N = len(data_labels)
+
+    if mode == "Pretrain head" and pretrained_names:
+        mapping = {}
+        other_list = []
+        exclude_list = []
+        for i in range(N):
+            v = dd_values[i] if i < len(dd_values) else "→ Other"
+            if v == "→ Exclude":
+                exclude_list.append(i)
+            elif v == "→ Other":
+                other_list.append(i)
+            else:
+                mapping[i] = v
+        if other_list:
+            for i in other_list: mapping[i] = "others"
+        used = set(mapping.values())
+        new_names = [n for n in pretrained_names if n in used]
+        if "others" in used and "others" not in new_names:
+            new_names.append("others")
+        label_map = {}
+        for i in range(N):
+            if i in exclude_list:
+                label_map[i] = None
+            elif i in mapping:
+                label_map[i] = new_names.index(mapping[i])
+        return new_names, label_map
+
+    # New head mode — follow CSV column order
+    kept_set = set()
+    merge_targets = {}
+    other_list = []
+    exclude_list = []
+    for i in range(N):
+        v = dd_values[i] if i < len(dd_values) else "keep"
+        if "(keep)" in str(v) or v == "keep":
+            kept_set.add(data_labels[i])
+        elif "merge into" in str(v):
+            merge_targets[i] = v.replace("→ merge into ", "")
+        elif v == "→ Other":
+            other_list.append(i)
+        elif v == "→ Exclude":
+            exclude_list.append(i)
+
+    new_names = [nm for nm in data_labels if nm in kept_set]
+    if other_list:
+        has_o = any(c.lower() in ("other","others") for c in new_names)
+        if not has_o: new_names.append("Other")
+
+    label_map = {}
+    for i in range(N):
+        if i in exclude_list:
+            label_map[i] = None
+            continue
+        nm = data_labels[i]
+        if nm in new_names:
+            label_map[i] = new_names.index(nm)
+        elif i in merge_targets:
+            t = merge_targets[i]
+            if t in new_names: label_map[i] = new_names.index(t)
+            else: label_map[i] = new_names.index("Other") if "Other" in new_names else 0
+        elif i in other_list:
+            oidx = next((j for j,n in enumerate(new_names) if n.lower() in ("other","others")), len(new_names)-1)
+            label_map[i] = oidx
+        else:
+            label_map[i] = 0
+
+    return new_names, label_map
+
+# ====================== Mapped Timeline ======================
+
+def build_mapped_timeline(vf, mapped_names, label_map):
+    """Build timeline HTML using mapped labels. None = excluded (shown as dim gray)."""
+    if not S["scan_data"] or not vf: return "", S["_cursor_data"]
+    d = next((x for x in S["scan_data"] if x["vf"]==vf), None)
+    if not d: return "", S["_cursor_data"]
+
+    T=d["T"]; fps=d["fps"]; raw_labels=d["labels"]
+    # Map raw labels to new indices; None → -1 (excluded)
+    mapped_labels = [label_map.get(l, 0) if label_map.get(l) is not None else -1 for l in raw_labels]
+    names = mapped_names
+
+    # Build bar
+    segs=[]; cur,cnt=mapped_labels[0],1
+    for i in range(1,T):
+        if mapped_labels[i]==cur: cnt+=1
+        else: segs.append((cur,cnt)); cur,cnt=mapped_labels[i],1
+    segs.append((cur,cnt))
+
+    bar=""
+    for li,c in segs:
+        if li == -1:
+            nm="excluded"; clr="#D0D0D0"; bdr=""
+        else:
+            nm=names[li] if li<len(names) else "?"
+            clr,_=get_clr(li,nm)
+            bdr="border-top:1px solid #ccc;border-bottom:1px solid #ccc;" if clr=="#FFFFFF" else ""
+        pct=(c/T)*100
+        bar+=f"<div style='width:{pct:.3f}%;height:100%;background:{clr};{bdr}display:inline-block;box-sizing:border-box;opacity:{0.35 if li==-1 else 1};' title='{nm}'></div>"
+
+    leg=""
+    for i,nm in enumerate(names):
+        clr,_=get_clr(i,nm); bdr="border:1px solid #ccc;" if clr=="#FFFFFF" else ""
+        leg+=f"<span style='display:inline-flex;align-items:center;gap:3px;margin-right:10px;font-size:11px;color:var(--color-text-secondary);'><span style='display:inline-block;width:8px;height:8px;border-radius:2px;background:{clr};{bdr}'></span>{nm}</span>"
+    # Add excluded legend if any excluded frames
+    if -1 in mapped_labels:
+        leg+=f"<span style='display:inline-flex;align-items:center;gap:3px;margin-right:10px;font-size:11px;color:var(--color-text-tertiary);'><span style='display:inline-block;width:8px;height:8px;border-radius:2px;background:#D0D0D0;opacity:0.5;'></span>excluded</span>"
+
+    ml0=mapped_labels[0]
+    nm0=names[ml0] if ml0>=0 and ml0<len(names) else "excluded"
+    tl=f"""<div style='width:100%;padding:4px 0;'>
+      <div style='position:relative;display:flex;height:16px;border-radius:4px;overflow:hidden;border:1px solid #ccc;'>
+        {bar}
+        <div id='tl-cursor' style='position:absolute;top:-2px;bottom:-2px;width:2px;background:#000;box-shadow:0 0 0 1px rgba(255,255,255,0.8);left:0%;pointer-events:none;'></div>
+      </div>
+      <div style='display:flex;justify-content:space-between;align-items:center;margin-top:3px;'>
+        <div>{leg}</div>
+        <span id='tl-frame-label' style='font-size:11px;font-weight:500;color:var(--color-text-secondary);'>F:0 {nm0}</span>
+      </div></div>"""
+
+    cursor_data = json.dumps({"T":T, "names":names, "labels":mapped_labels})
+    S["_cursor_data"] = cursor_data
+    return tl, cursor_data
+
+def build_mapping_summary_html(mode, dd_values, data_labels, pretrained_names):
+    """Build HTML summary of the mapping result."""
+    new_names, label_map = compute_label_map_from_dropdowns(mode, dd_values, data_labels, pretrained_names)
+    html = f"<div style='padding:6px 10px;background:var(--color-background-secondary);border-radius:8px;font-size:11px;color:var(--color-text-secondary);line-height:1.6;'>"
+    html += f"<span style='font-weight:500;'>Training classes ({len(new_names)}):</span> {', '.join(new_names)}"
+    html += "</div>"
+    return html
+
+# ====================== Label Distribution HTML ======================
+
+def build_label_dist_html():
+    if not S["scan_data"] or not S["label_names"]: return "<p style='color:#aaa;'>Load data to see labels</p>"
+    all_label_names=S["label_names"]; matched=S["scan_data"]; total_frames=sum(d["T"] for d in matched)
+    gcounts=Counter()
+    for d in matched:
+        for k,v in d["counts"].items(): gcounts[k]+=v
+    html="<div style='padding:4px 0;'>"
+    html+="<p style='font-size:13px;font-weight:500;margin:0 0 6px;'>Label distribution</p>"
+    for i,nm in enumerate(all_label_names):
+        c=gcounts.get(i,0); pct=100*c/max(total_frames,1); clr,_=get_clr(i,nm)
+        bar_clr="#ddd" if clr=="#FFFFFF" else clr
+        html+=f"<div style='margin-bottom:5px;'><div style='display:flex;align-items:center;gap:6px;margin-bottom:1px;'><span style='display:inline-block;width:8px;height:8px;border-radius:2px;background:{bar_clr};flex-shrink:0;{("border:1px solid #ccc;" if clr=="#FFFFFF" else "")}'></span><span style='font-size:12px;font-weight:500;flex:1;'>{nm}</span><span style='font-size:11px;color:#888;flex-shrink:0;'>{c:,} fr · {pct:.1f}%</span></div><div style='height:5px;background:#f0f0f0;border-radius:3px;overflow:hidden;margin-left:14px;'><div style='width:{max(pct,0.3):.1f}%;height:100%;background:{bar_clr};border-radius:3px;'></div></div></div>"
+    html+="</div>"
+    return html
+
 # ====================== Local video cache ======================
-# Same idea as in gui_training.py: copy from Drive to local disk before reading,
-# avoiding FUSE / network overhead on every frame seek.
+
+# When videos live on Google Drive (FUSE-mounted in Colab), every VideoReader
+# open + every frame seek goes through the network. For training/inference
+# this is 5-30x slower than reading from local disk and also more prone to
+# DataLoader worker timeouts. Caching the videos to /content/oab_video_cache/
+# at scan time avoids both problems. Skipped on re-runs if size matches.
+
 VIDEO_CACHE_DIR = "/content/oab_video_cache"
 
 def cache_video_to_local(src_path, cache_dir=VIDEO_CACHE_DIR):
+    """Copy src_path to cache_dir and return the local path. If a same-sized
+    file is already there, skip the copy. Returns the original path if copy
+    fails (so the caller can still proceed with the Drive path)."""
     try:
         os.makedirs(cache_dir, exist_ok=True)
         dst = os.path.join(cache_dir, os.path.basename(src_path))
+        # Skip if cached copy exists and size matches the source
         if os.path.exists(dst):
             try:
                 if os.path.getsize(dst) == os.path.getsize(src_path):
                     return dst
             except Exception:
-                pass
+                pass  # fall through and re-copy
         shutil.copy2(src_path, dst)
         return dst
     except Exception as e:
-        print(f"⚠️ Failed to cache {src_path}: {e}")
+        print(f"⚠️ Failed to cache {src_path}: {e}; falling back to original path")
         return src_path
 
-# ====================== State ======================
+# ====================== Data Scanning ======================
 
-S = {"model": None, "cfg": None, "results": {}, "cur": None, "vr": None,
-     "done": [], "idx": 0, "_active_vdir": None,
-     "_cursor_data": json.dumps({"T": 0, "names": [], "labels": []}),
-     "model_source": None, "disabled_classes": set()}
+def do_scan_and_preview(vdir, ldir, val_pct, val_seed, head_mode, *dd_vals):
+    N = MAX_LABELS
+    empty = lambda msg: (msg,"","*Load data first*",
+                         *[gr.update(visible=False,choices=[],value=None) for _ in range(N)],
+                         gr.update(choices=[],value=None),
+                         None,"","",gr.update(maximum=0,value=0),S["_cursor_data"],"","")
 
-CLR_PALETTE    = ["#378ADD","#D85A30","#E24B4A","#7F77DD","#1D9E75","#BA7517","#888780"]
-CLR_BG_PALETTE = ["rgba(55,138,221,0.9)","rgba(216,90,48,0.9)","rgba(226,75,74,0.9)",
-                   "rgba(127,119,221,0.9)","rgba(29,158,117,0.9)","rgba(186,117,23,0.9)","rgba(136,135,128,0.9)"]
+    if not vdir or not os.path.isdir(vdir): return empty(f"❌ Video dir not found")
+    if not ldir or not os.path.isdir(ldir): return empty(f"❌ Label dir not found")
 
-def get_clr(cfg, i):
-    names = cfg["class_names"]
-    nm = names[i] if i < len(names) else "others"
-    if nm.lower() in ("others", "other"):
-        return "#FFFFFF", "rgba(180,180,180,0.9)"
-    idx = i % len(CLR_PALETTE)
-    return CLR_PALETTE[idx], CLR_BG_PALETTE[idx]
+    vfiles=sorted([f for f in os.listdir(vdir) if f.lower().endswith((".mp4",".avi",".mov"))])
+    if not vfiles: return empty("❌ No videos found")
 
-U = gr.update()
+    # Build a lookup of all CSV files in label dir for flexible matching
+    csv_files = {os.path.splitext(f)[0].lower(): os.path.join(ldir, f)
+                 for f in os.listdir(ldir) if f.lower().endswith(".csv")}
 
-# ====================== Model Loading ======================
+    matched=[]; all_label_names=None
+    boris_count=0; onehot_count=0
 
-def list_models(repo):
-    try:
-        files = list_repo_files(repo)
-        pth_files = [f for f in files if f.endswith("/model.pth") or f == "model.pth"]
-        if not pth_files:
-            pth_files = [f for f in files if f.endswith(".pth")]
-        if not pth_files:
-            return gr.update(choices=[], value=None), "❌ No models found"
-        model_names = [os.path.dirname(p) if "/" in p else p for p in pth_files]
-        model_names = [m for m in model_names if not m.startswith("k400_")]
-        return gr.update(choices=model_names, value=model_names[0] if model_names else None), f"✅ {len(model_names)} model(s)"
-    except Exception as e:
-        return gr.update(choices=[], value=None), f"❌ {e}"
-
-def _post_load_updates(cfg):
-    names = cfg["class_names"]
-    toggle_choices = [nm for nm in names if nm.lower() not in ("others", "other")]
-    S["disabled_classes"] = set()
-    return (
-        gr.update(choices=toggle_choices, value=toggle_choices, visible=True),
-        _html_behavior_toggles(cfg),
-    )
-
-def _html_behavior_toggles(cfg):
-    if not cfg:
-        return "<p style='color:#aaa;font-size:13px;'>Load a model first</p>"
-    names = cfg["class_names"]
-    items = ""
-    for i, nm in enumerate(names):
-        if nm.lower() in ("others", "other"):
-            continue
-        _, bg = get_clr(cfg, i)
-        items += (f"<span style='display:inline-flex;align-items:center;gap:4px;margin-right:6px;"
-                  f"padding:3px 10px;border-radius:12px;background:{bg};color:white;"
-                  f"font-size:12px;font-weight:600;'>{nm}</span>")
-    return f"<div style='display:flex;flex-wrap:wrap;gap:4px;align-items:center;'>{items}</div>"
-
-def load_model_hf(repo, model_name):
-    if not model_name or not repo:
-        return "❌ Specify repo & model", U, ""
-    try:
-        if "/" in model_name or not model_name.endswith(".pth"):
-            cfg_file = f"{model_name}/config.json"
-            pth_file = f"{model_name}/model.pth"
-        else:
-            cfg_file = "config.json"
-            pth_file = model_name
-        with open(hf_hub_download(repo_id=repo, filename=cfg_file)) as f:
-            raw = json.load(f)
-        cfg, err = normalize_config(raw)
-        if err:
-            return f"❌ {err}", U, ""
-        pth_path = hf_hub_download(repo_id=repo, filename=pth_file)
-        model = build_model_from_config(cfg)
-        model.load_state_dict(torch.load(pth_path, map_location=device, weights_only=True))
-        model.to(device).eval()
-        S.update({"model": model, "cfg": cfg, "results": {}, "done": [], "cur": None, "vr": None, "model_source": "hf"})
-        toggle_upd, toggle_html = _post_load_updates(cfg)
-        return (f"✅ Loaded from HuggingFace!\n"
-                f"  Model: {model_name}\n"
-                f"  Backbone: {cfg['backbone']['name']} | Frames: {cfg['backbone']['num_frames']}\n"
-                f"  Classes ({len(cfg['class_names'])}): {cfg['class_names']}\n"
-                f"  Device: {device}",
-                toggle_upd, toggle_html)
-    except Exception as e:
-        return f"❌ {e}", U, ""
-
-def load_model_local(local_dir, pth_name):
-    if not pth_name or not local_dir:
-        return "❌ Select a local model", U, ""
-    pth_path = os.path.join(local_dir, pth_name)
-    if not os.path.exists(pth_path):
-        return f"❌ File not found: {pth_path}", U, ""
-    try:
-        cfg, cfg_source, err = find_config_for_pth(pth_path)
-        if err:
-            return f"❌ {err}\n\n💡 Place a config.json or <name>_config.json in same folder.", U, ""
-        model = build_model_from_config(cfg)
-        model.load_state_dict(torch.load(pth_path, map_location=device, weights_only=True))
-        model.to(device).eval()
-        S.update({"model": model, "cfg": cfg, "results": {}, "done": [], "cur": None, "vr": None, "model_source": "local"})
-        toggle_upd, toggle_html = _post_load_updates(cfg)
-        size_mb = os.path.getsize(pth_path) / 1024**2
-        return (f"✅ Loaded local model!\n"
-                f"  File: {pth_name} ({size_mb:.1f} MB)\n"
-                f"  Config: {cfg_source}\n"
-                f"  Backbone: {cfg['backbone']['name']} | Frames: {cfg['backbone']['num_frames']}\n"
-                f"  Classes ({len(cfg['class_names'])}): {cfg['class_names']}\n"
-                f"  Device: {device}",
-                toggle_upd, toggle_html)
-    except Exception as e:
-        import traceback
-        return f"❌ Load failed: {e}\n\n{traceback.format_exc()}", U, ""
-
-def scan_local_models(local_dir):
-    if not local_dir or not os.path.isdir(local_dir):
-        return gr.update(choices=[], value=None), "❌ Folder not found"
-    pth_files = []
-    for f in sorted(os.listdir(local_dir)):
-        fp = os.path.join(local_dir, f)
-        if f.endswith(".pth") and os.path.isfile(fp):
-            pth_files.append(f)
-        elif os.path.isdir(fp):
-            for sf in sorted(os.listdir(fp)):
-                if sf.endswith(".pth"):
-                    pth_files.append(os.path.join(f, sf))
-    if not pth_files:
-        return gr.update(choices=[], value=None), "❌ No .pth files found"
-    return gr.update(choices=pth_files, value=pth_files[0]), f"✅ {len(pth_files)} model(s) found"
-
-def on_toggle_change(enabled_behaviors):
-    if not S["cfg"]:
-        return ""
-    names = S["cfg"]["class_names"]
-    disabled = set()
-    for i, nm in enumerate(names):
-        if nm.lower() in ("others", "other"):
-            continue
-        if nm not in enabled_behaviors:
-            disabled.add(i)
-    S["disabled_classes"] = disabled
-    if disabled:
-        return f"⚠️ Disabled → Other: {[names[i] for i in sorted(disabled)]}"
-    return "✅ All behaviors active"
-
-DEMO_LOCAL_DIR = os.path.join(os.path.expanduser("~"), "demo_data")
-
-def load_demo_inference(repo):
-    """Download all files from HF demo/, scan videos, preview first one.
-    Does NOT modify the video folder path textbox."""
-    if not repo:
-        return gr.update(choices=[], value=None), "❌ Specify repo", None, "<p style='color:#aaa;'>Select a video</p>", gr.update(maximum=0, value=0), "", S["_cursor_data"]
-    try:
-        all_files = list_repo_files(repo)
-        demo_files = [f for f in all_files if f.startswith("demo/") and f != "demo/"]
-        if not demo_files:
-            return gr.update(choices=[], value=None), "❌ No files in demo/ folder", None, "", gr.update(maximum=0, value=0), "", S["_cursor_data"]
-        os.makedirs(DEMO_LOCAL_DIR, exist_ok=True)
-        for f in demo_files:
-            local = hf_hub_download(repo_id=repo, filename=f)
-            fname = os.path.basename(f)
-            dest = os.path.join(DEMO_LOCAL_DIR, fname)
-            if not os.path.exists(dest) or os.path.getsize(dest) != os.path.getsize(local):
-                import shutil; shutil.copy2(local, dest)
-        # Scan for videos
-        videos = sorted([f for f in os.listdir(DEMO_LOCAL_DIR) if f.lower().endswith((".mp4", ".avi", ".mov"))])
-        if not videos:
-            return gr.update(choices=[], value=None), "⚠️ No videos in demo/", None, "", gr.update(maximum=0, value=0), "", S["_cursor_data"]
-        # Store active dir in state
-        S["_active_vdir"] = DEMO_LOCAL_DIR
-        # Preview first video
-        vf = videos[0]
-        vp = os.path.join(DEMO_LOCAL_DIR, vf)
+    for vf in vfiles:
+        base=os.path.splitext(vf)[0]; lp=None
+        # Try exact match first, then flexible matching
+        for candidate in [base, base.replace("-",""), base.replace("_",""), base.replace("-","_"), base.replace("_","-")]:
+            # Try candidate.csv
+            fp=os.path.join(ldir, candidate+".csv")
+            if os.path.exists(fp): lp=fp; break
+            # Try candidate_one_hot.csv
+            fp=os.path.join(ldir, candidate+"_one_hot.csv")
+            if os.path.exists(fp): lp=fp; break
+            # Try case-insensitive lookup
+            if candidate.lower() in csv_files:
+                lp=csv_files[candidate.lower()]; break
+        if lp is None: continue
+        vp = os.path.join(vdir, vf)
         try:
-            vr = VideoReader(vp, ctx=cpu(0))
-            S["_preview_vr"] = vr; S["_preview_vf"] = vf
-            T = len(vr); fps = vr.get_avg_fps()
-            info = (f"<div style='display:flex;justify-content:space-between;align-items:center;'>"
-                    f"<span style='padding:4px 12px;border-radius:6px;background:rgba(180,180,180,0.7);color:white;font-size:13px;font-weight:600;'>Preview</span>"
-                    f"<span style='font-size:12px;color:#666;'>F: 0/{T} | 0.00s/{T/fps:.2f}s</span></div>")
-            img = vr[0].asnumpy()
-        except:
-            T = 0; info = ""; img = None
-        return (gr.update(choices=videos, value=vf),
-                f"✅ Demo loaded: {len(videos)} video(s)",
-                img, info, gr.update(maximum=max(T - 1, 0), value=0), "", S["_cursor_data"])
-    except Exception as e:
-        return gr.update(choices=[], value=None), f"❌ {e}", None, "", gr.update(maximum=0, value=0), "", S["_cursor_data"]
+            vr=VideoReader(vp,ctx=cpu(0)); T=len(vr); fps=vr.get_avg_fps()
+            # Free decord's frame cache as soon as we have what we need.
+            # Without this, scanning many videos accumulates ~tens of MB each
+            # in cached decoded frames and can OOM on Colab.
+            del vr
 
-def scan_videos_and_preview(vdir):
-    """Load folder: scan videos and preview the first one."""
-    if not vdir or not os.path.isdir(vdir):
-        return gr.update(choices=[], value=None), "❌ Not found", None, "", gr.update(maximum=0, value=0), "", S["_cursor_data"]
-    v = sorted([f for f in os.listdir(vdir) if f.lower().endswith((".mp4", ".avi", ".mov"))])
-    if not v:
-        return gr.update(choices=[], value=None), "❌ No videos", None, "", gr.update(maximum=0, value=0), "", S["_cursor_data"]
-    S["_active_vdir"] = vdir
-    # Preview first video
-    vf = v[0]
-    vp = os.path.join(vdir, vf)
-    try:
-        vr = VideoReader(vp, ctx=cpu(0))
-        S["_preview_vr"] = vr; S["_preview_vf"] = vf
-        T = len(vr); fps = vr.get_avg_fps()
-        info = (f"<div style='display:flex;justify-content:space-between;align-items:center;'>"
-                f"<span style='padding:4px 12px;border-radius:6px;background:rgba(180,180,180,0.7);color:white;font-size:13px;font-weight:600;'>Preview</span>"
-                f"<span style='font-size:12px;color:#666;'>F: 0/{T} | 0.00s/{T/fps:.2f}s</span></div>")
-        img = vr[0].asnumpy()
-    except:
-        T = 0; info = ""; img = None
-    return (gr.update(choices=v, value=vf), f"✅ {len(v)} videos",
-            img, info, gr.update(maximum=max(T - 1, 0), value=0), "", S["_cursor_data"])
+            # ---- detect format and load ----
+            boris = is_boris_csv(lp)
+            oh, col_names = load_label_data(lp, T, fps)
 
-# ====================== HTML Builders ======================
-
-def html_progress(vd, vt, cur_name, wd, wt, ws=None, elapsed=None):
-    if vt == 0: return ""
-    vp = (vd / vt) * 100; wp = (wd / max(wt, 1)) * 100
-    vc = "#1D9E75" if vd == vt else "#D85A30"
-    st = "✅ Complete" if vd == vt else "Processing..."
-    rate_str = ""
-    if elapsed and elapsed > 0.1 and wd > 0:
-        wps = wd / elapsed
-        if ws and ws > 0:
-            rate_str = f" · {wps:.1f} win/s · {wps*ws:.0f} frame/s"
-        else:
-            rate_str = f" · {wps:.1f} win/s"
-    return f"""<div style="background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:10px 14px;">
-      <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
-        <span style="font-size:13px;font-weight:600;">Batch — {st}</span>
-        <span style="font-size:12px;color:#888;">{vd}/{vt} videos</span></div>
-      <div style="height:8px;background:#eee;border-radius:4px;overflow:hidden;margin-bottom:10px;">
-        <div style="width:{vp:.1f}%;height:100%;background:{vc};border-radius:4px;"></div></div>
-      <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
-        <span style="font-size:12px;font-weight:500;">Current: {cur_name}</span>
-        <span style="font-size:12px;color:#888;">{wd}/{wt} windows{rate_str}</span></div>
-      <div style="height:6px;background:#eee;border-radius:3px;overflow:hidden;">
-        <div style="width:{wp:.1f}%;height:100%;background:#1D9E75;border-radius:3px;"></div></div>
-    </div>"""
-
-def html_timeline(vf):
-    r = S["results"].get(vf)
-    if not r: return ""
-    cfg = S["cfg"]; names = cfg["class_names"]; labels = r["frame_labels"]; T = len(labels)
-    if T == 0: return ""
-    segs = []; cur, cnt = labels[0], 1
-    for i in range(1, T):
-        if labels[i] == cur: cnt += 1
-        else: segs.append((cur, cnt)); cur, cnt = labels[i], 1
-    segs.append((cur, cnt))
-    bar = ""
-    for li, c in segs:
-        clr, _ = get_clr(cfg, li); pct = (c / T) * 100
-        bdr = "border-top:1px solid #ccc;border-bottom:1px solid #ccc;" if clr == "#FFFFFF" else ""
-        nm = names[li] if li < len(names) else "?"
-        bar += f"<div style='width:{pct:.3f}%;height:100%;background:{clr};{bdr}display:inline-block;box-sizing:border-box;' title='{nm}'></div>"
-    leg = ""
-    for i, nm in enumerate(names):
-        clr, _ = get_clr(cfg, i)
-        bdr = "border:1px solid #ccc;" if clr == "#FFFFFF" else ""
-        leg += (f"<span style='display:inline-flex;align-items:center;gap:4px;margin-right:12px;font-size:12px;'>"
-                f"<span style='display:inline-block;width:10px;height:10px;border-radius:2px;background:{clr};{bdr}'></span>{nm}</span>")
-    nm0 = names[labels[0]] if labels[0] < len(names) else "?"
-    return f"""<div style="width:100%;padding:4px 0;">
-      <div style="position:relative;display:flex;height:18px;border-radius:4px;overflow:hidden;border:1px solid #ccc;">
-        {bar}
-        <div id="tl-cursor" style="position:absolute;top:-2px;bottom:-2px;width:2px;background:#000;left:0%;pointer-events:none;"></div>
-      </div>
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px;">
-        <div>{leg}</div>
-        <span id="tl-frame-label" style="font-size:12px;font-weight:500;color:#555;">F:0 {nm0}</span>
-      </div></div>"""
-
-def html_behavior(vf):
-    r = S["results"].get(vf)
-    if not r: return "<p style='color:#aaa;'>Run inference first</p>"
-    cfg = S["cfg"]; names = cfg["class_names"]; T = r["total_frames"]; fps = r["fps"]
-    cnt = Counter(r["frame_labels"])
-    h = f"<div style='padding:4px 0;'>"
-    h += f"<div style='display:flex;justify-content:space-between;margin-bottom:8px;'><span style='font-size:14px;font-weight:600;'>Behavior statistics</span><span style='font-size:12px;color:#888;'>{vf}</span></div>"
-    for i, nm in enumerate(names):
-        c = cnt.get(i, 0); pct = 100 * c / max(T, 1); dur = c / max(fps, 1)
-        clr, _ = get_clr(cfg, i); bar_clr = "#ddd" if clr == "#FFFFFF" else clr
-        h += f"<div style='margin-bottom:8px;'><div style='display:flex;justify-content:space-between;margin-bottom:2px;'><span style='font-size:13px;font-weight:500;'>{nm}</span><span style='font-size:12px;color:#888;'>{c:,} fr · {pct:.1f}% · {dur:.1f}s</span></div><div style='height:8px;background:#f0f0f0;border-radius:4px;overflow:hidden;'><div style='width:{max(pct,0.3):.1f}%;height:100%;background:{bar_clr};border-radius:4px;'></div></div></div>"
-    h += f"<div style='display:flex;gap:10px;margin-top:10px;padding-top:8px;border-top:1px solid #eee;'><div style='flex:1;background:#f7f7f7;border-radius:6px;padding:6px;text-align:center;'><div style='font-size:11px;color:#888;'>Frames</div><div style='font-size:16px;font-weight:600;'>{T:,}</div></div><div style='flex:1;background:#f7f7f7;border-radius:6px;padding:6px;text-align:center;'><div style='font-size:11px;color:#888;'>FPS</div><div style='font-size:16px;font-weight:600;'>{fps:.1f}</div></div><div style='flex:1;background:#f7f7f7;border-radius:6px;padding:6px;text-align:center;'><div style='font-size:11px;color:#888;'>Duration</div><div style='font-size:16px;font-weight:600;'>{T/fps:.1f}s</div></div></div></div>"
-    return h
-
-def html_export_preview(vf, fmt):
-    r = S["results"].get(vf)
-    if not r: return "<p style='color:#aaa;font-size:13px;'>Run inference first</p>"
-    names = S["cfg"]["class_names"]; labels = r["frame_labels"]; fps = r["fps"]
-    td = "padding:3px 6px;border-bottom:1px solid #eee;font-size:11px;font-family:monospace;"
-    th = f"{td}font-weight:bold;color:#666;"
-    if fmt == "One-hot CSV (per-frame)":
-        hdr = f"<tr><td style='{th}'>frame</td>" + "".join(f"<td style='{th}'>{n[:6]}</td>" for n in names) + "</tr>"
-        rows = "".join(
-            f"<tr><td style='{td}'>{i}</td>" + "".join(f"<td style='{td}'>{'1' if labels[i]==ci else '0'}</td>" for ci in range(len(names))) + "</tr>"
-            for i in range(min(5, len(labels)))
-        ) + f"<tr><td style='{td}' colspan='{len(names)+1}'>... ({len(labels)} rows)</td></tr>"
-        title = "One-hot CSV preview"
-    else:
-        hdr = f"<tr><td style='{th}'>time</td><td style='{th}'>media</td><td style='{th}'>subj</td><td style='{th}'>behavior</td><td style='{th}'>status</td></tr>"
-        evts = []
-        if labels:
-            cur, st = labels[0], 0
-            for i in range(1, len(labels)):
-                if labels[i] != cur: evts.append((st, i, cur)); cur, st = labels[i], i
-            evts.append((st, len(labels), cur))
-        rows = "".join(
-            f"<tr><td style='{td}'>{s/fps:.3f}</td><td style='{td}'>{vf[:12]}</td><td style='{td}'>pair</td><td style='{td}'>{names[c] if c<len(names) else '?'}</td><td style='{td}'>START</td></tr>"
-            f"<tr><td style='{td}'>{e/fps:.3f}</td><td style='{td}'>{vf[:12]}</td><td style='{td}'>pair</td><td style='{td}'>{names[c] if c<len(names) else '?'}</td><td style='{td}'>STOP</td></tr>"
-            for s, e, c in evts[:3]
-        ) + f"<tr><td style='{td}' colspan='5'>... ({len(evts)} events)</td></tr>"
-        title = "BORIS event log preview"
-    return f"<div style='margin-top:4px;'><p style='font-size:12px;color:#666;font-weight:600;margin:0 0 4px;'>{title}</p><div style='overflow-x:auto;border:1px solid #eee;border-radius:4px;'><table style='border-collapse:collapse;width:100%;'>{hdr}{rows}</table></div></div>"
-
-def update_export_preview(fmt):
-    return html_export_preview(S["cur"], fmt) if S["cur"] else "<p style='color:#aaa;'>No results</p>"
-
-# ====================== Display ======================
-
-def preview_frame(vdir, vf, fi):
-    """Get a frame from a video file directly (no inference needed)."""
-    if not vf or not vdir:
-        return None
-    vp = os.path.join(vdir, vf)
-    if not os.path.exists(vp):
-        return None
-    try:
-        if S.get("_preview_vf") != vf or S.get("_preview_vr") is None:
-            S["_preview_vr"] = VideoReader(vp, ctx=cpu(0))
-            S["_preview_vf"] = vf
-        vr = S["_preview_vr"]
-        fi = max(0, min(int(fi), len(vr) - 1))
-        return vr[fi].asnumpy()
-    except:
-        return None
-
-def preview_info_html(vdir, vf, fi):
-    """Frame info for preview mode (no inference labels)."""
-    if not vf or not vdir:
-        return "<p style='color:#aaa;'>Select a video to preview</p>"
-    # If we have inference results, use those
-    r = S["results"].get(vf)
-    if r:
-        return frame_info_html(vf, fi)
-    # Otherwise just show frame / time info
-    vp = os.path.join(vdir, vf)
-    if not os.path.exists(vp):
-        return "<p style='color:#aaa;'>Video not found</p>"
-    try:
-        if S.get("_preview_vf") != vf or S.get("_preview_vr") is None:
-            S["_preview_vr"] = VideoReader(vp, ctx=cpu(0))
-            S["_preview_vf"] = vf
-        vr = S["_preview_vr"]
-        T = len(vr); fps = vr.get_avg_fps(); fi = max(0, min(int(fi), T - 1))
-        return (f"<div style='display:flex;justify-content:space-between;align-items:center;'>"
-                f"<span style='padding:4px 12px;border-radius:6px;background:rgba(180,180,180,0.7);color:white;font-size:13px;font-weight:600;'>Preview</span>"
-                f"<span style='font-size:12px;color:#666;'>F: {fi}/{T} | {fi/fps:.2f}s/{T/fps:.2f}s</span></div>")
-    except:
-        return "<p style='color:#aaa;'>Cannot read video</p>"
-
-def _vdir(vdir_input):
-    """Return active video dir: prefer S state (set by demo/load), fallback to textbox."""
-    return S.get("_active_vdir") or vdir_input
-
-def on_video_select(vf):
-    """When user selects a video from dropdown, show first frame + set scrubber."""
-    vdir = S.get("_active_vdir")
-    if not vf or not vdir:
-        return None, "<p style='color:#aaa;'>Select a video</p>", gr.update(maximum=0, value=0), "", S["_cursor_data"]
-    # If we have inference results for this video, show full view
-    r = S["results"].get(vf)
-    if r:
-        S["cur"] = vf; S["vr"] = None; _update_cursor(vf)
-        T = r["total_frames"]
-        return (get_frame(vf, 0), frame_info_html(vf, 0),
-                gr.update(maximum=max(T - 1, 0), value=0),
-                html_timeline(vf), S["_cursor_data"])
-    # No results yet — just preview raw video
-    vp = os.path.join(vdir, vf)
-    if not os.path.exists(vp):
-        return None, "<p style='color:#aaa;'>Video not found</p>", gr.update(maximum=0, value=0), "", S["_cursor_data"]
-    try:
-        vr = VideoReader(vp, ctx=cpu(0))
-        S["_preview_vr"] = vr; S["_preview_vf"] = vf
-        T = len(vr); fps = vr.get_avg_fps()
-        info = (f"<div style='display:flex;justify-content:space-between;align-items:center;'>"
-                f"<span style='padding:4px 12px;border-radius:6px;background:rgba(180,180,180,0.7);color:white;font-size:13px;font-weight:600;'>Preview</span>"
-                f"<span style='font-size:12px;color:#666;'>F: 0/{T} | 0.00s/{T/fps:.2f}s</span></div>")
-        return vr[0].asnumpy(), info, gr.update(maximum=max(T - 1, 0), value=0), "", S["_cursor_data"]
-    except Exception as e:
-        return None, f"<p style='color:#aaa;'>Error: {e}</p>", gr.update(maximum=0, value=0), "", S["_cursor_data"]
-
-def get_frame(vf, fi):
-    r = S["results"].get(vf)
-    if not r: return None
-    if S["cur"] != vf or S["vr"] is None:
-        S["vr"] = VideoReader(r["video_path"], ctx=cpu(0)); S["cur"] = vf
-    return S["vr"][max(0, min(fi, len(S["vr"]) - 1))].asnumpy()
-
-def frame_info_html(vf, fi):
-    r = S["results"].get(vf)
-    if not r: return "<p style='color:#aaa;'>Run inference first</p>"
-    cfg = S["cfg"]; names = cfg["class_names"]; T = r["total_frames"]; fps = r["fps"]
-    fi = max(0, min(fi, T - 1)); li = r["frame_labels"][fi]; nm = names[li]
-    conf = r["frame_confidences"][fi][li] * 100; _, bg = get_clr(cfg, li)
-    return (f"<div style='display:flex;justify-content:space-between;align-items:center;'>"
-            f"<span style='padding:4px 12px;border-radius:6px;background:{bg};color:white;font-size:13px;font-weight:600;'>{nm} ({conf:.0f}%)</span>"
-            f"<span style='font-size:12px;color:#666;'>F: {fi}/{T} | {fi/fps:.2f}s/{T/fps:.2f}s</span></div>")
-
-def nav_md():
-    d = S["done"]; i = S["idx"]
-    if not d: return "*No results*"
-    return f"**{d[i]}** — {i+1}/{len(d)} completed"
-
-def _update_cursor(vf):
-    r = S["results"].get(vf)
-    if not r: S["_cursor_data"] = json.dumps({"T": 0, "names": [], "labels": []})
-    else: S["_cursor_data"] = json.dumps({"T": r["total_frames"], "names": S["cfg"]["class_names"], "labels": r["frame_labels"]})
-
-def _full(vf, fi=0, vd=0, vt=0):
-    r = S["results"].get(vf)
-    if not r:
-        e = ""; return e, e, None, e, e, e, "*No results*", gr.update(maximum=0, value=0), S["_cursor_data"]
-    S["cur"] = vf; S["vr"] = None
-    if vf in S["done"]: S["idx"] = S["done"].index(vf)
-    T = r["total_frames"]; _update_cursor(vf)
-    return (html_progress(vd, vt, vf, T, T), frame_info_html(vf, fi), get_frame(vf, fi),
-            html_timeline(vf), html_behavior(vf),
-            html_export_preview(vf, "One-hot CSV (per-frame)"),
-            nav_md(), gr.update(maximum=max(T - 1, 0), value=0), S["_cursor_data"])
-
-# ====================== Actions ======================
-
-def run_single(vf, cache_local):
-    vdir = S.get("_active_vdir")
-    if not S["model"]: yield "", "", None, "", "", "", "❌ Load model first", U, S["_cursor_data"]; return
-    if not vf or not vdir: yield "", "", None, "", "", "", "❌ Select video", U, S["_cursor_data"]; return
-    ws = S["cfg"]["backbone"]["num_frames"] if S.get("cfg") else None
-    # Cache this single file to local disk if requested. We pass the cache dir
-    # to infer_video_gen so it reads from the fast path.
-    eff_vdir = vdir
-    if cache_local:
-        local_path = cache_video_to_local(os.path.join(vdir, vf))
-        eff_vdir = os.path.dirname(local_path)
-    t0 = time.perf_counter()
-    result = None
-    for msg in infer_video_gen(eff_vdir, vf, S["model"], S["cfg"], S["disabled_classes"]):
-        if isinstance(msg, dict): result = msg
-        else:
-            wd, wt = msg
-            yield html_progress(0, 1, vf, wd, wt, ws=ws, elapsed=time.perf_counter()-t0), U, U, U, U, U, U, U, U
-    S["results"][vf] = result
-    if vf not in S["done"]: S["done"].append(vf)
-    yield _full(vf, 0, 1, 1)
-
-def run_batch(cache_local):
-    vdir = S.get("_active_vdir")
-    if not S["model"]: yield "", "", None, "", "", "", "❌ Load model first", U, S["_cursor_data"], ""; return
-    if not vdir or not os.path.isdir(vdir): yield "", "", None, "", "", "", "❌ Load videos first", U, S["_cursor_data"], ""; return
-    vids = sorted([f for f in os.listdir(vdir) if f.lower().endswith((".mp4", ".avi", ".mov"))])
-    if not vids: yield "", "", None, "", "", "", "❌ No videos", U, S["_cursor_data"], ""; return
-    ws = S["cfg"]["backbone"]["num_frames"] if S.get("cfg") else None
-    total = len(vids); blog = []
-    for vi, vf in enumerate(vids):
-        # Cache each video lazily — only when its turn comes up. Avoids
-        # spending time copying files the user might cancel before reaching.
-        eff_vdir = vdir
-        if cache_local:
-            local_path = cache_video_to_local(os.path.join(vdir, vf))
-            eff_vdir = os.path.dirname(local_path)
-        t0 = time.perf_counter()  # reset timer per video for stable in-video rate
-        result = None
-        for msg in infer_video_gen(eff_vdir, vf, S["model"], S["cfg"], S["disabled_classes"]):
-            if isinstance(msg, dict): result = msg
+            if boris:
+                boris_count += 1
             else:
-                wd, wt = msg
-                yield html_progress(vi, total, vf, wd, wt, ws=ws, elapsed=time.perf_counter()-t0), U, U, U, U, U, U, U, U, U
-        S["results"][vf] = result
-        if vf not in S["done"]: S["done"].append(vf)
-        blog.append(f"✅ {vf} ({result['total_frames']} fr)")
-        S["cur"] = vf; S["vr"] = None; _update_cursor(vf)
-        if vf in S["done"]: S["idx"] = S["done"].index(vf)
-        T = result["total_frames"]
-        yield (html_progress(vi + 1, total, vf, T, T, ws=ws, elapsed=time.perf_counter()-t0),
-               frame_info_html(vf, 0), get_frame(vf, 0),
-               html_timeline(vf), html_behavior(vf),
-               html_export_preview(vf, "One-hot CSV (per-frame)"),
-               nav_md(), gr.update(maximum=max(T - 1, 0), value=0),
-               S["_cursor_data"], "\n".join(blog))
+                onehot_count += 1
 
-def on_scrub(fi):
-    fi = int(fi)
-    vdir = S.get("_active_vdir")
-    vf = S["cur"]
-    # If inference results exist, use them
-    if vf and vf in S["results"]:
-        return get_frame(vf, fi), frame_info_html(vf, fi)
-    # Otherwise, preview mode — use the currently selected video
-    preview_vf = S.get("_preview_vf")
-    if preview_vf and vdir:
-        return preview_frame(vdir, preview_vf, fi), preview_info_html(vdir, preview_vf, fi)
-    return None, "<p style='color:#aaa;'>Select a video to preview</p>"
+            # sanity check: one-hot CSVs must match frame count exactly
+            if not boris and T != len(oh):
+                print(f"⚠️ Length mismatch (one-hot) {vf}: video={T}, csv={len(oh)}")
+                continue
 
-def do_nav(direction):
-    d = S["done"]
-    if not d: return "", "", None, "", "", "", "*No results*", gr.update(), S["_cursor_data"]
-    if direction == "prev": S["idx"] = max(0, S["idx"] - 1)
-    else: S["idx"] = min(len(d) - 1, S["idx"] + 1)
-    return _full(d[S["idx"]], 0, len(d), len(d))
+            # Defer label computation until we know the global column union.
+            # Storing oh + col_names per file lets us realign correctly later.
+            matched.append({
+                "vp": vp, "lp": lp, "vf": vf,
+                "T": T, "fps": fps,
+                "_oh_raw": oh, "_cols_raw": col_names,
+                "is_boris": boris,
+            })
+        except Exception as e:
+            print(f"⚠️ Skipped {vf}: {e}")
+            continue
 
-# ====================== Export ======================
+    if not matched: return empty("❌ No matched pairs")
 
-def _exp_onehot(vf, od):
-    if vf not in S["results"]: return "❌"
-    r = S["results"][vf]; names = S["cfg"]["class_names"]; nc = len(names)
-    os.makedirs(od, exist_ok=True)
-    rows = [[1 if l == ci else 0 for ci in range(nc)] for l in r["frame_labels"]]
-    df = pd.DataFrame(rows, columns=names); df.insert(0, "frame", range(len(rows)))
-    p = os.path.join(od, vf.rsplit(".", 1)[0] + "_onehot.csv"); df.to_csv(p, index=False)
-    return f"✅ {p}"
+    # ---- compute global label set as the UNION of all files' columns ----
+    # This is critical: if file A has [dark eye patch, extended tentacle, Other]
+    # and file B has only [dark eye patch, Other], we cannot just adopt the
+    # first file's columns — we need every behaviour seen across the dataset.
+    # Order = first-appearance order, then "Other" pushed to last if present.
+    global_names = []
+    for d in matched:
+        for n in d["_cols_raw"]:
+            if n not in global_names:
+                global_names.append(n)
+    if "Other" in global_names:
+        global_names = [n for n in global_names if n != "Other"] + ["Other"]
+    all_label_names = global_names
 
-def _exp_boris(vf, od):
-    if vf not in S["results"]: return "❌"
-    r = S["results"][vf]; names = S["cfg"]["class_names"]; fps = r["fps"]; L = r["frame_labels"]
-    os.makedirs(od, exist_ok=True); evts = []; cur, st = L[0], 0
-    for i in range(1, len(L)):
-        if L[i] != cur:
-            evts += [{"Time": round(st/fps, 3), "Media": vf, "Subject": "pair", "Behavior": names[cur], "Status": "START"},
-                     {"Time": round(i/fps, 3),  "Media": vf, "Subject": "pair", "Behavior": names[cur], "Status": "STOP"}]
-            cur, st = L[i], i
-    evts += [{"Time": round(st/fps, 3),       "Media": vf, "Subject": "pair", "Behavior": names[cur], "Status": "START"},
-             {"Time": round(len(L)/fps, 3),    "Media": vf, "Subject": "pair", "Behavior": names[cur], "Status": "STOP"}]
-    p = os.path.join(od, vf.rsplit(".", 1)[0] + "_boris.csv"); pd.DataFrame(evts).to_csv(p, index=False)
-    return f"✅ {p}"
+    # Now realign each file's onehot to the global column order, then compute
+    # per-frame argmax labels in the global namespace.
+    n_misaligned = 0
+    for d in matched:
+        oh_local = d.pop("_oh_raw")
+        cols_local = d.pop("_cols_raw")
+        if cols_local != all_label_names:
+            n_misaligned += 1
+            print(f"⚠️ Column set differs in {d['vf']} (has {cols_local}); realigning to global order")
+        oh_global = align_onehot_to_global(oh_local, cols_local, all_label_names)
+        labels = np.argmax(oh_global, axis=1)
+        d["counts"] = Counter(labels.tolist())
+        d["labels"] = labels.tolist()
+    if n_misaligned:
+        print(f"ℹ️ Realigned {n_misaligned}/{len(matched)} file(s) to global label order: {all_label_names}")
 
-def do_export_cur(vf, od, fmt):
-    vf = S["cur"]
-    if not vf: return "❌"
-    return _exp_onehot(vf, od) if fmt == "One-hot CSV (per-frame)" else _exp_boris(vf, od)
+    S["scan_data"]=matched; S["label_names"]=all_label_names
+    compute_split(val_pct, val_seed)
+    dist=build_label_dist_html()
 
-def do_export_all(od, fmt):
-    if not S["done"]: return "❌"
-    return "\n".join(_exp_onehot(v, od) if fmt == "One-hot CSV (per-frame)" else _exp_boris(v, od) for v in S["done"])
+    # format summary for status bar
+    fmt_parts = []
+    if boris_count:   fmt_parts.append(f"{boris_count} BORIS")
+    if onehot_count:  fmt_parts.append(f"{onehot_count} one-hot")
+    fmt_str = f" ({', '.join(fmt_parts)})" if fmt_parts else ""
+
+    pretrained_names = S["cfg"]["class_names"] if S["cfg"] else []
+
+    # Build mapping dropdown updates
+    dd_updates = []
+    for i in range(N):
+        if i < len(all_label_names):
+            if head_mode == "Pretrain head" and pretrained_names:
+                choices, default = build_mapping_choices_pt(i, all_label_names, pretrained_names)
+            else:
+                choices = build_mapping_choices_new(i, all_label_names, {})
+                default = choices[0]
+            dd_updates.append(gr.update(visible=True, choices=choices, value=default, label=all_label_names[i]))
+        else:
+            dd_updates.append(gr.update(visible=False, choices=[], value=None))
+
+    # Video dropdown
+    vnames=[d["vf"] for d in matched]
+    vid_dd_update=gr.update(choices=vnames,value=vnames[0])
+
+    # Preview first video with initial mapping
+    vf=matched[0]["vf"]
+    dd_values = [u["value"] for u in dd_updates[:len(all_label_names)]]
+    new_names, label_map = compute_label_map_from_dropdowns(head_mode, dd_values, all_label_names, pretrained_names)
+    tl, cdata = build_mapped_timeline(vf, new_names, label_map)
+    summary = build_mapping_summary_html(head_mode, dd_values, all_label_names, pretrained_names)
+
+    img = _get_frame(vf, 0)
+    d0 = next(x for x in matched if x["vf"]==vf)
+    T=d0["T"]; fps=d0["fps"]
+    ml = label_map.get(d0["labels"][0], 0)
+    nm0 = new_names[ml] if ml is not None and ml < len(new_names) else "?"
+    _,bg = get_clr(ml if ml is not None else 0, nm0)
+    info = f"<div style='display:flex;justify-content:space-between;align-items:center;'><span style='padding:3px 10px;border-radius:6px;background:{bg};color:white;font-size:12px;font-weight:500;'>{nm0}</span><span style='font-size:12px;color:var(--color-text-secondary);'>F: 0 / {T} | 0.00s / {T/fps:.2f}s</span></div>"
+
+    nav_t=f"**{vf}** — 1 / {len(matched)} videos"
+    vid_list=build_video_list_html(active_vf=vf)
+    status=f"✅ {len(matched)} matched (of {len(vfiles)} videos){fmt_str}"
+
+    return (status, dist, nav_t, *dd_updates, vid_dd_update,
+            img, info, tl, gr.update(maximum=max(T-1,0),value=0), cdata, vid_list, summary)
+
+
+# ====================== Mapping Change Handler ======================
+
+def on_mapping_change(head_mode, *dd_vals):
+    """When any mapping dropdown or head mode changes → rebuild all dropdowns + timeline + summary."""
+    data_labels = S["label_names"]
+    pretrained_names = S["cfg"]["class_names"] if S["cfg"] else []
+    N = MAX_LABELS
+    n = len(data_labels)
+
+    if n == 0:
+        # must match map_change_outputs: [*map_dds, timeline_html, cursor_state, mapping_summary]
+        return (*[gr.update() for _ in range(N)], "", S["_cursor_data"], "")
+
+    # Parse current values
+    cur_vals = list(dd_vals[:N])
+
+    if head_mode == "Pretrain head" and pretrained_names:
+        # Pretrain: choices are static, no need to rebuild
+        dd_updates = []
+        for i in range(N):
+            if i < n:
+                choices, default = build_mapping_choices_pt(i, data_labels, pretrained_names)
+                current = cur_vals[i]
+                if current in choices:
+                    dd_updates.append(gr.update(choices=choices, value=current, label=data_labels[i]))
+                else:
+                    dd_updates.append(gr.update(choices=choices, value=default, label=data_labels[i]))
+            else:
+                dd_updates.append(gr.update())
+    else:
+        # New head: rebuild choices dynamically (consumed labels disappear)
+        mappings = {}
+        for i in range(n):
+            v = cur_vals[i] if i < len(cur_vals) else "keep"
+            mappings[str(i)] = parse_mapping_value(v, data_labels)
+
+        dd_updates = []
+        for i in range(N):
+            if i < n:
+                choices = build_mapping_choices_new(i, data_labels, mappings)
+                current = cur_vals[i]
+                if current in choices:
+                    dd_updates.append(gr.update(choices=choices, value=current))
+                else:
+                    dd_updates.append(gr.update(choices=choices, value=choices[0]))
+            else:
+                dd_updates.append(gr.update())
+
+    # Compute final mapping + rebuild timeline
+    final_vals = [dd_updates[i].get("value", cur_vals[i]) if isinstance(dd_updates[i], dict) and "value" in dd_updates[i] else cur_vals[i] for i in range(n)]
+    new_names, label_map = compute_label_map_from_dropdowns(head_mode, final_vals, data_labels, pretrained_names)
+
+    vf = S["cur_vf"]
+    tl, cdata = build_mapped_timeline(vf, new_names, label_map) if vf else ("", S["_cursor_data"])
+    summary = build_mapping_summary_html(head_mode, final_vals, data_labels, pretrained_names)
+
+    return (*dd_updates, tl, cdata, summary)
+
+def on_head_mode_change(head_mode, *dd_vals):
+    """When head mode toggles, rebuild all dropdown choices for the new mode."""
+    return on_mapping_change(head_mode, *dd_vals)
+
+# ====================== Video Preview ======================
+
+def _get_frame(vf, fi):
+    if not S["scan_data"]: return None
+    d=next((x for x in S["scan_data"] if x["vf"]==vf),None)
+    if not d: return None
+    try:
+        if S["cur_vf"]!=vf or S["cur_vr"] is None:
+            # IMPORTANT: explicitly release the old VideoReader before opening a
+            # new one. decord's VideoReader holds a C++ frame cache + open file
+            # descriptor that Python's GC may not free promptly — without this,
+            # switching between videos in the preview will leak hundreds of MB
+            # per switch and crash Colab on RAM.
+            old = S.get("cur_vr")
+            if old is not None:
+                S["cur_vr"] = None
+                del old
+                import gc; gc.collect()
+            S["cur_vr"]=VideoReader(d["vp"],ctx=cpu(0)); S["cur_vf"]=vf
+        T=len(S["cur_vr"]); fi=max(0,min(int(fi),T-1))
+        return S["cur_vr"][fi].asnumpy()
+    except: S["cur_vr"]=None; S["cur_vf"]=None; return None
+
+def _preview_video_mapped(vf, head_mode, dd_vals):
+    """Preview video with current mapping applied."""
+    if not S["scan_data"] or not vf: return None,"","",U,S["_cursor_data"]
+    d=next((x for x in S["scan_data"] if x["vf"]==vf),None)
+    if not d: return None,"","",U,S["_cursor_data"]
+
+    data_labels=S["label_names"]; pretrained_names=S["cfg"]["class_names"] if S["cfg"] else []
+    new_names, label_map = compute_label_map_from_dropdowns(head_mode, list(dd_vals[:len(data_labels)]), data_labels, pretrained_names)
+
+    T=d["T"]; fps=d["fps"]
+    tl, cdata = build_mapped_timeline(vf, new_names, label_map)
+
+    ml = label_map.get(d["labels"][0], 0)
+    nm0 = new_names[ml] if ml is not None and ml < len(new_names) else "?"
+    _,bg = get_clr(ml if ml is not None else 0, nm0)
+    info = f"<div style='display:flex;justify-content:space-between;align-items:center;'><span style='padding:3px 10px;border-radius:6px;background:{bg};color:white;font-size:12px;font-weight:500;'>{nm0}</span><span style='font-size:12px;color:var(--color-text-secondary);'>F: 0 / {T} | 0.00s / {T/fps:.2f}s</span></div>"
+
+    img = _get_frame(vf, 0)
+    return img, info, tl, gr.update(maximum=max(T-1,0),value=0), cdata
+
+def on_scrub(fi, head_mode, *dd_vals):
+    vf=S["cur_vf"]
+    if not vf or not S["scan_data"]: return None,"<p style='color:#aaa;'>No data</p>"
+    d=next((x for x in S["scan_data"] if x["vf"]==vf),None)
+    if not d: return None,""
+
+    data_labels=S["label_names"]; pretrained_names=S["cfg"]["class_names"] if S["cfg"] else []
+    new_names,label_map=compute_label_map_from_dropdowns(head_mode,list(dd_vals[:len(data_labels)]),data_labels,pretrained_names)
+
+    T=d["T"]; fps=d["fps"]; fi=max(0,min(int(fi),T-1))
+    ml=label_map.get(d["labels"][fi],0)
+    nm=new_names[ml] if ml is not None and ml<len(new_names) else "?"
+    _,bg=get_clr(ml if ml is not None else 0,nm)
+    info=f"<div style='display:flex;justify-content:space-between;align-items:center;'><span style='padding:3px 10px;border-radius:6px;background:{bg};color:white;font-size:12px;font-weight:500;'>{nm}</span><span style='font-size:12px;color:var(--color-text-secondary);'>F: {fi} / {T} | {fi/fps:.2f}s / {T/fps:.2f}s</span></div>"
+    return _get_frame(vf,fi), info
+
+def do_nav(direction, head_mode, *dd_vals):
+    if not S["scan_data"]: return None,"","",U,S["_cursor_data"],"*No data*",""
+    vnames=[d["vf"] for d in S["scan_data"]]; cur=S["cur_vf"]
+    idx=vnames.index(cur) if cur in vnames else 0
+    if direction=="prev": idx=max(0,idx-1)
+    else: idx=min(len(vnames)-1,idx+1)
+    vf=vnames[idx]
+    img,info,tl,scrub,cdata=_preview_video_mapped(vf,head_mode,dd_vals)
+    vid_list=build_video_list_html(active_vf=vf)
+    return img,info,tl,scrub,cdata,f"**{vf}** — {idx+1} / {len(vnames)} videos",vid_list
+
+def on_vid_change(vf, head_mode, *dd_vals):
+    img,info,tl,scrub,cdata=_preview_video_mapped(vf,head_mode,dd_vals)
+    vid_list=build_video_list_html(active_vf=vf)
+    idx=0; total=0
+    if S["scan_data"]:
+        vnames=[d["vf"] for d in S["scan_data"]]
+        total=len(vnames)
+        if vf in vnames: idx=vnames.index(vf)
+    nav_txt=f"**{vf}** — {idx+1} / {total} videos" if total else "*Load data first*"
+    return img,info,tl,scrub,cdata,vid_list,nav_txt
+
+def on_val_ratio_change(val_pct, val_seed):
+    compute_split(val_pct, val_seed)
+    return build_video_list_html(active_vf=S["cur_vf"])
+
+# ====================== Progress + Validation HTML ======================
+
+def html_progress(ep_done,ep_total,win_done,win_total,phase="training",ws=None,elapsed=None):
+    if ep_total==0: return ""
+    ep_pct=(ep_done/ep_total)*100; wp=(win_done/max(win_total,1))*100
+    ec="#1D9E75" if ep_done==ep_total else "#D85A30"
+    st="✅ Complete" if ep_done==ep_total else "Training..."
+    # Throughput: windows/sec and frames/sec (= win/s × window_size)
+    rate_str=""
+    if elapsed and elapsed>0.1 and win_done>0:
+        wps=win_done/elapsed
+        if ws and ws>0:
+            rate_str=f" · {wps:.1f} win/s · {wps*ws:.0f} frame/s"
+        else:
+            rate_str=f" · {wps:.1f} win/s"
+    return f"<div style='background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:10px 14px;'><div style='display:flex;justify-content:space-between;margin-bottom:4px;'><span style='font-size:13px;font-weight:500;'>Epoch — {st}</span><span style='font-size:12px;color:#888;'>{ep_done}/{ep_total} epochs</span></div><div style='height:8px;background:#eee;border-radius:4px;overflow:hidden;margin-bottom:10px;'><div style='width:{ep_pct:.1f}%;height:100%;background:{ec};border-radius:4px;transition:width 0.3s;'></div></div><div style='display:flex;justify-content:space-between;margin-bottom:4px;'><span style='font-size:12px;font-weight:500;'>Epoch {min(ep_done+1,ep_total)} — {phase}</span><span style='font-size:12px;color:#888;'>{win_done}/{win_total} windows{rate_str}</span></div><div style='height:6px;background:#eee;border-radius:3px;overflow:hidden;'><div style='width:{wp:.1f}%;height:100%;background:#1D9E75;border-radius:3px;transition:width 0.15s;'></div></div></div>"
+
+def html_cache_progress(done, total, current_name, mb_done=0, elapsed=None):
+    """Pre-training video caching progress. Shares the same widget as
+    html_progress so the user sees one unified status area in the centre column."""
+    pct = (done / max(total, 1)) * 100
+    color = "#1D9E75" if done == total else "#D85A30"
+    label = "✅ Cached" if done == total else "Caching to local disk..."
+    rate = ""
+    if elapsed and elapsed > 0.5 and mb_done > 0:
+        rate = f" · {mb_done/elapsed:.1f} MB/s"
+    cur_str = f"Current: {current_name}" if current_name and done < total else "Ready"
+    return f"<div style='background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:10px 14px;'><div style='display:flex;justify-content:space-between;margin-bottom:4px;'><span style='font-size:13px;font-weight:500;'>Preparing — {label}</span><span style='font-size:12px;color:#888;'>{done}/{total} videos{rate}</span></div><div style='height:8px;background:#eee;border-radius:4px;overflow:hidden;margin-bottom:10px;'><div style='width:{pct:.1f}%;height:100%;background:{color};border-radius:4px;transition:width 0.3s;'></div></div><div style='font-size:12px;color:#666;'>{cur_str}</div></div>"
+
+def html_val_card(epoch,loss,f1,mAP,f1_per,ap_per,names,prec_per=None,rec_per=None,is_best=False):
+    brd="border:2px solid var(--color-border-info);" if is_best else "border:0.5px solid var(--color-border-tertiary);"
+    badge="<span style='font-size:10px;padding:2px 6px;background:var(--color-background-info);color:var(--color-text-info);border-radius:var(--border-radius-md);margin-left:6px;'>best</span>" if is_best else ""
+    fc="color:var(--color-text-info);" if is_best else ""
+    prec_per=prec_per or []; rec_per=rec_per or []
+    def _row(i,nm):
+        p=prec_per[i] if i<len(prec_per) else 0.0
+        r=rec_per[i] if i<len(rec_per) else 0.0
+        f=f1_per[i] if i<len(f1_per) else 0.0
+        a=ap_per[i] if i<len(ap_per) else 0.0
+        return f"<div style='display:flex;justify-content:space-between;'><span>{nm}</span><span style='font-variant-numeric:tabular-nums;'>P: {p:.2f} · R: {r:.2f} · F1: {f:.2f} · AP: {a:.2f}</span></div>"
+    rows="".join(_row(i,nm) for i,nm in enumerate(names))
+    return f"<div style='background:var(--color-background-primary);{brd}border-radius:var(--border-radius-lg);padding:14px;margin-bottom:12px;'><div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;'><div style='display:flex;align-items:center;'><span style='font-size:13px;font-weight:500;'>Epoch {epoch}</span>{badge}</div><span style='font-size:11px;color:var(--color-text-secondary);'>loss: {loss:.4f}</span></div><div style='display:flex;gap:8px;margin-bottom:8px;'><div style='flex:1;background:var(--color-background-secondary);border-radius:var(--border-radius-md);padding:6px;text-align:center;'><div style='font-size:11px;color:var(--color-text-secondary);'>F1-macro</div><div style='font-size:16px;font-weight:500;{fc}'>{f1:.4f}</div></div><div style='flex:1;background:var(--color-background-secondary);border-radius:var(--border-radius-md);padding:6px;text-align:center;'><div style='font-size:11px;color:var(--color-text-secondary);'>mAP</div><div style='font-size:16px;font-weight:500;{fc}'>{mAP:.4f}</div></div></div><div style='font-size:11px;color:var(--color-text-secondary);line-height:1.6;'>{rows}</div></div>"
+
+def build_val_html(log,names):
+    if not log: return "<p style='color:#aaa;'>Training not started</p>"
+    best=max(range(len(log)),key=lambda i:log[i]["f1"])
+    return "".join(html_val_card(e["epoch"],e["loss"],e["f1"],e["mAP"],e["f1_per"],e["ap_per"],names,e.get("prec_per"),e.get("rec_per"),i==best) for i,e in enumerate(log))
+
+# ====================== Training ======================
+
+def run_training(repo,mname,vdir,ldir,odir,head_mode,
+                 n_epochs,batch_sz,lr_str,val_pct,ws,stride_val,val_seed,train_seed,
+                 num_workers,cache_local,
+                 aug_blur_frac,aug_tdrop_frac,aug_hflip_p,aug_vflip_p,
+                 aug_rot_deg,aug_brightness,aug_contrast,aug_saturation,
+                 aug_mult,aug_excluded_classes,
+                 *dd_vals):
+    try:
+        lr=float(lr_str); val_ratio=float(val_pct)/100.0; n_epochs=int(n_epochs)
+        batch_sz=int(batch_sz); ws=int(ws); stride_val=int(stride_val)
+        val_seed=int(val_seed); train_seed=int(train_seed)
+        num_workers=int(num_workers)
+        aug_blur_frac=float(aug_blur_frac); aug_tdrop_frac=float(aug_tdrop_frac)
+        aug_hflip_p=float(aug_hflip_p); aug_vflip_p=float(aug_vflip_p)
+        aug_rot_deg=float(aug_rot_deg); aug_brightness=float(aug_brightness)
+        aug_contrast=float(aug_contrast); aug_saturation=float(aug_saturation)
+        aug_mult=int(aug_mult)
+        aug_excluded_classes=list(aug_excluded_classes) if aug_excluded_classes else []
+    except Exception as e: yield f"❌ Invalid params: {e}",U; return
+
+    if not S["model"] or not S["cfg"]: yield "❌ Load model first",U; return
+    if not S["scan_data"]: yield "❌ Load data first",U; return
+
+    cfg=S["cfg"]; data_labels=S["label_names"]
+    pretrained_names=cfg["class_names"]
+    os.makedirs(odir,exist_ok=True)
+
+    # Compute label map from dropdown values
+    vals = list(dd_vals[:len(data_labels)])
+    new_names, label_map = compute_label_map_from_dropdowns(head_mode, vals, data_labels, pretrained_names)
+    new_nc = len(new_names)
+
+    print(f"🏷️ Label mapping: {label_map}")
+    print(f"🏷️ Training classes ({new_nc}): {new_names}")
+
+    # Deep copy pretrained model so S["model"] stays pristine for re-training
+    import copy
+    model = copy.deepcopy(S["model"])
+    model = rebuild_head(model, cfg, new_nc).to(device)
+
+    data=S["scan_data"]
+    tidx=S["split_indices"]["train"]; vidx=S["split_indices"]["val"]
+    if not tidx and not vidx:
+        if val_ratio>0 and len(data)>=4: tidx,vidx=train_test_split(list(range(len(data))),test_size=val_ratio,random_state=val_seed)
+        else: tidx=list(range(len(data))); vidx=[]
+
+    # ---- Cache videos to local disk if requested ----
+    # We do this here (not at scan time) so the user gets immediate feedback
+    # when "Load folder" is clicked, and the slow copy step happens visibly
+    # under the same progress widget once they press Train.
+    used_idxs = sorted(set(tidx) | set(vidx))  # only cache videos that will be used
+    if cache_local and used_idxs:
+        n_total = len(used_idxs)
+        cache_t0 = time.perf_counter()
+        mb_done = 0.0
+        # Show 0/N immediately so user knows something started
+        yield html_cache_progress(0, n_total, data[used_idxs[0]]["vf"]),"<p style='color:#aaa;'>Caching...</p>"
+        for i, di in enumerate(used_idxs):
+            d = data[di]
+            src_path = d["vp"]
+            # Only cache if source is not already inside the cache dir (avoids
+            # re-cache when user trains again on the same data without re-loading).
+            if not src_path.startswith(VIDEO_CACHE_DIR):
+                local_path = cache_video_to_local(src_path)
+                if local_path != src_path:
+                    d["vp"] = local_path  # mutate scan_data so all future reads use local
+                    try:
+                        mb_done += os.path.getsize(local_path) / (1024*1024)
+                    except Exception:
+                        pass
+            yield html_cache_progress(i+1, n_total,
+                                      data[used_idxs[i+1]]["vf"] if i+1 < n_total else "",
+                                      mb_done=mb_done,
+                                      elapsed=time.perf_counter()-cache_t0), U
+
+    # Now (possibly cached) paths can be collected
+    vps=[d["vp"] for d in data]; lps=[d["lp"] for d in data]
+
+    yield html_progress(0,n_epochs,0,0,"building dataset...",ws=ws),"<p style='color:#aaa;'>Building...</p>"
+
+    # Online augmentation: uses the `random` module globally so each DataLoader
+    # worker (seeded via worker_init_fn below) gets its own stream, and every
+    # epoch re-draws independently. This is the standard PyTorch pattern.
+    def aug(fr):
+        # Spatial (whole-window consistent) first, then photometric, then per-frame
+        fr=horizontal_flip(fr,prob=aug_hflip_p)
+        fr=vertical_flip(fr,prob=aug_vflip_p)
+        fr=random_rotation(fr,max_deg=aug_rot_deg)
+        fr=color_jitter(fr,brightness=aug_brightness,contrast=aug_contrast,saturation=aug_saturation)
+        fr=random_blur(fr,frac=aug_blur_frac)
+        fr=temporal_dropout(fr,frac=aug_tdrop_frac)
+        return fr
+
+    train_ds=SlidingWindowDataset([vps[i] for i in tidx],[lps[i] for i in tidx],ws,stride_val,cfg,new_nc,label_map,augment=aug)
+    val_ds=SlidingWindowDataset([vps[i] for i in vidx],[lps[i] for i in vidx],ws,stride_val,cfg,new_nc,label_map) if vidx else None
+
+    if len(train_ds)==0: yield "❌ No training windows created.",""; return
+
+    # ----- Class balancing: duplicate sample-list entries for selected classes -----
+    # Note: only the (video_path, frame_indices, label) tuples are duplicated —
+    # not the actual frames. Each time the same window is drawn by the DataLoader,
+    # online augmentation re-rolls independently, producing different augmented
+    # results. Effect is equivalent to offline augmentation but costs no disk
+    # and almost no RAM; only cost is that epoch time scales with the multiplier.
+    if aug_mult > 1:
+        excluded_idx = set()
+        for cname in aug_excluded_classes:
+            if cname in new_names:
+                excluded_idx.add(new_names.index(cname))
+        orig_samples = train_ds.samples[:]
+        orig_labels = train_ds.sample_labels[:]
+        n_before = len(orig_samples)
+        extra_samples = []
+        extra_labels = []
+        n_duplicated = 0
+        for s, l in zip(orig_samples, orig_labels):
+            if l in excluded_idx:
+                continue
+            # add (mult - 1) extra copies; the original already counts as 1
+            for _ in range(aug_mult - 1):
+                extra_samples.append(s)
+                extra_labels.append(l)
+            n_duplicated += 1
+        train_ds.samples = orig_samples + extra_samples
+        train_ds.sample_labels = orig_labels + extra_labels
+        print(f"📈 Class balancing: {n_before} → {len(train_ds.samples)} windows "
+              f"(×{aug_mult} for {n_duplicated} non-excluded windows, "
+              f"excluded classes: {aug_excluded_classes or 'none'})")
+
+    # Reproducible shuffle + per-worker seeding for true per-epoch randomness
+    g = torch.Generator(); g.manual_seed(train_seed)
+    def _worker_init(worker_id):
+        seed = train_seed + worker_id
+        random.seed(seed)
+        np.random.seed(seed % (2**32))
+
+    # worker_init_fn / persistent_workers are only meaningful when num_workers > 0
+    train_loader_kwargs = dict(batch_size=batch_sz, shuffle=True, pin_memory=True,
+                               num_workers=num_workers, generator=g)
+    if num_workers > 0:
+        train_loader_kwargs["worker_init_fn"] = _worker_init
+    train_loader = DataLoader(train_ds, **train_loader_kwargs)
+
+    val_loader = DataLoader(val_ds, batch_sz, shuffle=False, num_workers=num_workers,
+                            pin_memory=True) if val_ds and len(val_ds) > 0 else None
+    total_win=len(train_ds)
+
+    optimizer=optim.AdamW(model.parameters(),lr=lr,weight_decay=0.01)
+    scheduler=CosineAnnealingLR(optimizer,T_max=n_epochs)
+    scaler=GradScaler(); criterion=nn.CrossEntropyLoss(); accum=2
+    S["train_log"]=[]
+
+    for ep in range(n_epochs):
+        model.train(); rl=0.0; optimizer.zero_grad(set_to_none=True); nb=len(train_loader)
+        ep_t0=time.perf_counter()
+        for bi,(vids,tgts) in enumerate(train_loader):
+            vids=vids.to(device); tgts=tgts.to(device)
+            with autocast(): loss=criterion(model(vids),tgts)/accum
+            scaler.scale(loss).backward()
+            if (bi+1)%accum==0 or (bi+1)==nb: scaler.step(optimizer); scaler.update(); optimizer.zero_grad(set_to_none=True)
+            rl+=loss.item()*accum*vids.size(0)
+            if (bi+1)%5==0 or bi==nb-1:
+                wd=min((bi+1)*batch_sz,total_win)
+                yield html_progress(ep,n_epochs,wd,total_win,"training",ws=ws,elapsed=time.perf_counter()-ep_t0),U
+
+        scheduler.step(); ep_loss=rl/len(train_ds)
+        f1m=0; mAP=0; f1p=[]; app=[]; precp=[]; recp=[]
+        if val_loader:
+            model.eval(); ap_=[]; al_=[]; apr_=[]; val_total=len(val_ds); nb_val=len(val_loader)
+            val_t0=time.perf_counter()
+            with torch.no_grad():
+                for vi,(v,t) in enumerate(val_loader):
+                    v=v.to(device)
+                    with autocast(): o=model(v); pr=torch.softmax(o,dim=1)
+                    # .detach() defends against edge cases where autocast or PyTorch
+                    # version leaves tensors in a grad-tracking state even inside no_grad
+                    ap_.extend(torch.argmax(o,1).detach().cpu().numpy())
+                    al_.extend(t.detach().cpu().numpy())
+                    apr_.extend(pr.detach().cpu().numpy())
+                    if (vi+1)%5==0 or vi==nb_val-1:
+                        vd=min((vi+1)*batch_sz,val_total)
+                        yield html_progress(ep,n_epochs,vd,val_total,"validating",ws=ws,elapsed=time.perf_counter()-val_t0),U
+            f1p=f1_score(al_,ap_,average=None,labels=list(range(new_nc)),zero_division=0).tolist()
+            f1m=f1_score(al_,ap_,average="macro",zero_division=0)
+            precp=precision_score(al_,ap_,average=None,labels=list(range(new_nc)),zero_division=0).tolist()
+            recp=recall_score(al_,ap_,average=None,labels=list(range(new_nc)),zero_division=0).tolist()
+            oh=np.zeros((len(al_),new_nc))
+            for i,l in enumerate(al_): oh[i,l]=1
+            pr_arr=np.array(apr_)
+            for ci in range(new_nc):
+                try: app.append(average_precision_score(oh[:,ci],pr_arr[:,ci]))
+                except: app.append(0.0)
+            mAP=np.mean(app)
+
+        mp=os.path.join(odir,f"epoch_{ep+1}_f1_{f1m:.4f}_map_{mAP:.4f}.pth")
+        torch.save(model.state_dict(),mp)
+
+        # Save config.json alongside .pth — compatible with test code
+        cfg_out = {
+            "model_info": {
+                "backbone": cfg["backbone"]["name"],
+                "head": {"in_features": cfg["head"]["in_features"], "hidden_dim": cfg["head"]["hidden_dim"],
+                         "dropout": cfg["head"]["dropout"], "pool": cfg["head"].get("pool","cls_token")},
+                "input_format": cfg.get("input_format", {}),
+                "backbone_config": {"input_size": cfg["backbone"].get("input_size",224),
+                                    "num_frames": cfg["backbone"].get("num_frames",8)},
+            },
+            # Fields the test code needs directly:
+            "ALL_BEHAVIOR_NAMES": list(data_labels),
+            "SELECTED_BEHAVIORS": list(new_names),
+            "num_classes": new_nc,
+            "class_names": list(new_names),
+            # original_to_new: same format as test code
+            # selected → sequential index, unselected → null (test code treats as None → exclude)
+            "original_to_new": {
+                str(i): label_map[i] if i in label_map else None
+                for i in range(len(data_labels))
+            },
+            # Full mapping details for reference
+            "mapping_mode": head_mode,
+            "mapping_detail": {
+                data_labels[i]: {"target": new_names[label_map[i]] if i in label_map and label_map[i] is not None else "excluded",
+                                 "target_idx": label_map.get(i, None)}
+                for i in range(len(data_labels))
+            },
+            "training_params": {
+                "epochs": n_epochs, "batch_size": batch_sz, "lr": lr,
+                "window_size": ws, "stride": stride_val,
+                "val_seed": val_seed, "train_seed": train_seed,
+            },
+            "augmentation": {
+                "blur_frac": aug_blur_frac,
+                "temporal_dropout_frac": aug_tdrop_frac,
+                "horizontal_flip_prob": aug_hflip_p,
+                "vertical_flip_prob": aug_vflip_p,
+                "rotation_deg": aug_rot_deg,
+                "brightness": aug_brightness,
+                "contrast": aug_contrast,
+                "saturation": aug_saturation,
+                "class_multiplier": aug_mult,
+                "class_multiplier_excluded": aug_excluded_classes,
+            },
+        }
+        cfg_path = mp.replace(".pth", "_config.json")
+        with open(cfg_path, "w") as f: json.dump(cfg_out, f, indent=2)
+
+        S["train_log"].append({"epoch":ep+1,"loss":ep_loss,"f1":f1m,"mAP":mAP,"f1_per":f1p,"ap_per":app,"prec_per":precp,"rec_per":recp,"path":mp,"config_path":cfg_path})
+        yield html_progress(ep+1,n_epochs,total_win,total_win,"done",ws=ws),build_val_html(S["train_log"],new_names)
+
+    with open(os.path.join(odir,"training_log.json"),"w") as f: json.dump(S["train_log"],f,indent=2)
+    print("✅ Training complete!")
 
 # ====================== Cursor JS ======================
 
@@ -607,108 +1365,246 @@ CURSOR_JS = """
     try { const d=JSON.parse(labels_json); T=d.T; names=d.names; labels=d.labels; } catch(e) { return fi; }
     if (T===0) return fi;
     fi = Math.max(0, Math.min(Math.floor(fi), T-1));
-    const cursor = document.getElementById('tl-cursor');
-    if (cursor) cursor.style.left = ((fi/T)*100)+'%';
-    const lbl = document.getElementById('tl-frame-label');
-    if (lbl) { const cls=labels[fi]; lbl.textContent='F:'+fi+' '+(names[cls]||'?'); }
+    const c = document.getElementById('tl-cursor');
+    if (c) c.style.left = ((fi/T)*100)+'%';
+    const l = document.getElementById('tl-frame-label');
+    if (l) { const cls=labels[fi]; l.textContent='F:'+fi+' '+(names[cls]||'?'); }
     return fi;
 }
 """
 
+YELLOW_THEME = gr.themes.Soft(primary_hue=gr.themes.colors.amber, secondary_hue=gr.themes.colors.yellow, neutral_hue=gr.themes.colors.gray)
+
+# ====================== Demo Loading ======================
+
+DEMO_LOCAL_DIR = os.path.join(os.path.expanduser("~"), "demo_data")
+
+def load_demo_training(repo, val_pct, val_seed, head_mode, *dd_vals):
+    """Download ALL files from HF repo demo/ folder, then auto-scan.
+    Returns same outputs as do_scan_and_preview so everything loads in one click."""
+    N = MAX_LABELS
+    empty = lambda msg: (msg, "", "*Load data first*",
+                         *[gr.update(visible=False, choices=[], value=None) for _ in range(N)],
+                         gr.update(choices=[], value=None),
+                         None, "", "", gr.update(maximum=0, value=0), S["_cursor_data"], "", "")
+    if not repo:
+        return empty("❌ Specify repo")
+    try:
+        all_files = list_repo_files(repo)
+        demo_files = [f for f in all_files if f.startswith("demo/") and f != "demo/"]
+        if not demo_files:
+            return empty("❌ No files in demo/ folder on HuggingFace")
+        os.makedirs(DEMO_LOCAL_DIR, exist_ok=True)
+        for f in demo_files:
+            local = hf_hub_download(repo_id=repo, filename=f)
+            fname = os.path.basename(f)
+            dest = os.path.join(DEMO_LOCAL_DIR, fname)
+            if not os.path.exists(dest) or os.path.getsize(dest) != os.path.getsize(local):
+                shutil.copy2(local, dest)
+        # Now run the same scan logic with demo dir.
+        return do_scan_and_preview(DEMO_LOCAL_DIR, DEMO_LOCAL_DIR, val_pct, val_seed, head_mode, *dd_vals)
+    except Exception as e:
+        return empty(f"❌ {e}")
+
 # ====================== GUI ======================
 
-GREEN_THEME = gr.themes.Soft(
-    primary_hue=gr.themes.colors.green,
-    secondary_hue=gr.themes.colors.emerald,
-    neutral_hue=gr.themes.colors.gray,
-)
-
-with gr.Blocks(title="Animal Behavior Inference", theme=GREEN_THEME) as demo:
-    gr.Markdown("# Animal Social Behavior Inference")
-    gr.Markdown("HuggingFace & Local models — auto config detection — behavior filtering")
+with gr.Blocks(title="Training", theme=YELLOW_THEME) as demo:
+    gr.Markdown("# 🏋️ Animal Behavior Model Training")
+    gr.Markdown("Fine-tune from pretrained — preview labels & configure mapping before training")
 
     cursor_state = gr.Textbox(value=S["_cursor_data"], visible=False)
+    repo_in = gr.Textbox(value=HF_REPO_ID, visible=False)
 
     with gr.Row():
-        with gr.Column(scale=1, min_width=260):
+        # ===== LEFT =====
+        with gr.Column(scale=1, min_width=250):
             gr.Markdown("### ① Select model")
-            with gr.Tabs():
-                with gr.TabItem("☁️ HuggingFace"):
-                    repo_in = gr.Textbox(value=HF_REPO_ID, label="HF Repo ID", interactive=True)
-                    hf_model_dd = gr.Dropdown(label="Model", choices=[], interactive=True)
-                    hf_load_btn = gr.Button("📥 Load model", variant="primary")
-                with gr.TabItem("💾 Local folder"):
-                    local_dir_in = gr.Textbox(label="Model folder path", value=DEFAULT_LOCAL_MODEL_DIRS[0] if DEFAULT_LOCAL_MODEL_DIRS else "", interactive=True)
-                    local_model_dd = gr.Dropdown(label="Model (.pth)", choices=[], interactive=True)
-                    local_scan_btn = gr.Button("🔍 Scan folder", variant="secondary", size="sm")
-                    local_load_btn = gr.Button("📥 Load model", variant="primary")
-            model_st = gr.Textbox(label="Model status", interactive=False, lines=5)
+            model_dd=gr.Dropdown(label="Base model",choices=[],interactive=True)
+            load_btn=gr.Button("📥 Load pretrained",variant="primary")
+            model_st=gr.Textbox(label="Status",interactive=False,lines=4)
             gr.Markdown("---")
-            gr.Markdown("### ② Load video folder")
-            vdir_in = gr.Textbox(label="Video folder path", value=DEFAULT_VIDEO_DIR)
-            inf_cache_local_cb = gr.Checkbox(label="Cache videos to local disk", value=True,
-                info="Copy videos from Drive to /content before inference (much faster). Cached files reused on re-runs.")
-            demo_btn = gr.Button("🎯 Load Demo", variant="secondary", size="sm")
-            load_folder_btn = gr.Button("📂 Load folder", variant="secondary")
-            scan_st = gr.Textbox(label="Folder status", interactive=False, lines=1)
-            gr.Markdown("---")
-            gr.Markdown("### ③ Inference")
-            video_dd = gr.Dropdown(label="Select video", choices=[], interactive=True)
-            batch_btn = gr.Button("📦 Batch inference (all videos)", variant="primary", size="lg")
-            batch_log_tb = gr.Textbox(label="Batch log", interactive=False, lines=8)
-            run_btn = gr.Button("🚀 Run inference (single)", variant="secondary")
+            gr.Markdown("### ② Load data")
+            vdir_in=gr.Textbox(label="Video directory",value=DEFAULT_VIDEO_DIR)
+            ldir_in=gr.Textbox(label="Label directory",value=DEFAULT_LABEL_DIR)
+            odir_in=gr.Textbox(label="Output directory",value=DEFAULT_OUTPUT_DIR)
+            demo_btn=gr.Button("🎯 Load Demo",variant="secondary",size="sm")
+            scan_d=gr.Button("📂 Load folder",variant="secondary")
+            scan_st=gr.Textbox(label="Folder status",interactive=False,lines=1)
 
+        # ===== CENTER =====
         with gr.Column(scale=2, min_width=400):
-            toggle_label_html = gr.HTML("<p style='color:#aaa;font-size:13px;'>Load a model to see behaviors</p>")
-            behavior_toggles = gr.CheckboxGroup(label="Active behaviors (unchecked → merged to Other)", choices=[], value=[], interactive=True, visible=False)
-            toggle_status = gr.Textbox(interactive=False, lines=1, visible=False, show_label=False)
-            batch_prog = gr.HTML("")
-            info_html = gr.HTML("<p style='color:#aaa;'>Load a model and run inference</p>")
-            frame_img = gr.Image(label="Frame preview", type="numpy", interactive=False)
-            timeline_html = gr.HTML("")
-            scrubber = gr.Slider(minimum=0, maximum=100, step=1, value=0, label="Frame", interactive=True)
+            progress_html=gr.HTML("")
+            info_html=gr.HTML("<p style='color:#aaa;'>Load data to preview</p>")
+            frame_img=gr.Image(label="Frame preview",type="numpy",interactive=False)
+            timeline_html=gr.HTML("")
+            scrubber=gr.Slider(minimum=0,maximum=100,step=1,value=0,label="Frame",interactive=True)
             with gr.Row():
-                prev_btn = gr.Button("◀ Previous video", size="sm")
-                nav_md_out = gr.Markdown("*No results yet*")
-                next_btn = gr.Button("Next video ▶", size="sm")
+                prev_btn=gr.Button("◀ Prev",size="sm")
+                nav_md=gr.Markdown("*Load data first*")
+                next_btn=gr.Button("Next ▶",size="sm")
             gr.Markdown("---")
-            behavior_html = gr.HTML("<p style='color:#aaa;'>Run inference to see statistics</p>")
+            with gr.Accordion("📹 Videos", open=False):
+                vid_list_html=gr.HTML("<p style='color:#aaa;font-size:12px;'>Load data first</p>")
+            gr.Markdown("---")
 
-        with gr.Column(scale=1, min_width=260):
-            gr.Markdown("### ④ Export")
-            exp_fmt = gr.Dropdown(label="Output format", choices=["One-hot CSV (per-frame)", "BORIS event log"], value="One-hot CSV (per-frame)", interactive=True)
-            exp_prev = gr.HTML("<p style='color:#aaa;font-size:13px;'>Run inference first</p>")
-            out_dir = gr.Textbox(label="Save to", value=DEFAULT_OUTPUT_DIR)
-            exp_cur = gr.Button("💾 Export current video", variant="primary")
-            exp_all = gr.Button("📦 Export all (batch)")
-            exp_log = gr.Textbox(label="Export log", interactive=False, lines=6)
+            # Label distribution
+            with gr.Accordion("📊 Label distribution", open=False):
+                label_dist_html=gr.HTML("<p style='color:#aaa;'>Load data to see labels</p>")
 
-    demo.load(list_models, [repo_in], [hf_model_dd, model_st])
-    hf_load_btn.click(load_model_hf, [repo_in, hf_model_dd], [model_st, behavior_toggles, toggle_label_html])
-    local_scan_btn.click(scan_local_models, [local_dir_in], [local_model_dd, model_st])
-    local_load_btn.click(load_model_local, [local_dir_in, local_model_dd], [model_st, behavior_toggles, toggle_label_html])
-    behavior_toggles.change(on_toggle_change, [behavior_toggles], [toggle_status])
+            # Head type + mapping dropdowns
+            gr.Markdown("### 🏷️ Label mapping")
+            head_mode_dd=gr.Dropdown(label="Head type",choices=["Pretrain head","New head"],value="Pretrain head",interactive=True)
 
-    # Shared outputs for demo/load folder: video dropdown, status, preview frame, info, scrubber, timeline, cursor
-    load_outputs = [video_dd, scan_st, frame_img, info_html, scrubber, timeline_html, cursor_state]
-    demo_btn.click(load_demo_inference, [repo_in], load_outputs)
-    load_folder_btn.click(scan_videos_and_preview, [vdir_in], load_outputs)
+            # Pre-build MAX_LABELS dropdown slots (hidden by default)
+            map_dds = []
+            for i in range(MAX_LABELS):
+                dd = gr.Dropdown(label=f"label_{i}", choices=[], value=None, interactive=True, visible=False)
+                map_dds.append(dd)
 
-    # Video selection triggers preview (frame + scrubber setup)
-    video_dd.change(on_video_select, [video_dd], [frame_img, info_html, scrubber, timeline_html, cursor_state])
+            mapping_summary=gr.HTML("")
 
-    out9 = [batch_prog, info_html, frame_img, timeline_html, behavior_html, exp_prev, nav_md_out, scrubber, cursor_state]
-    out10 = out9 + [batch_log_tb]
+            # Hidden video dropdown
+            vid_dd=gr.Dropdown(label="Video",choices=[],interactive=True,visible=False)
 
-    run_btn.click(run_single, [video_dd, inf_cache_local_cb], out9)
-    batch_btn.click(run_batch, [inf_cache_local_cb], out10)
-    scrubber.input(fn=None, inputs=[scrubber, cursor_state], outputs=[scrubber], js=CURSOR_JS)
-    scrubber.change(on_scrub, inputs=[scrubber], outputs=[frame_img, info_html])
-    prev_btn.click(lambda: do_nav("prev"), [], out9)
-    next_btn.click(lambda: do_nav("next"), [], out9)
-    exp_fmt.change(update_export_preview, [exp_fmt], [exp_prev])
-    exp_cur.click(do_export_cur, [video_dd, out_dir, exp_fmt], [exp_log])
-    exp_all.click(do_export_all, [out_dir, exp_fmt], [exp_log])
+        # ===== RIGHT =====
+        with gr.Column(scale=1, min_width=280):
+            gr.Markdown("### ③ Train")
+            vr_in=gr.Slider(minimum=0,maximum=50,step=5,value=15,label="Validation ratio (%)",interactive=True)
+            with gr.Row():
+                ep_in=gr.Number(label="Epochs",value=5,precision=0)
+                bs_in=gr.Number(label="Batch",value=8,precision=0)
+            with gr.Row():
+                lr_in=gr.Textbox(label="LR",value="3.8e-5")
+            with gr.Row():
+                ws_in=gr.Number(label="Window",value=16,precision=0)
+                st_in=gr.Number(label="Stride",value=4,precision=0)
+            with gr.Row():
+                val_seed_in=gr.Number(label="Val seed",value=1337,precision=0,info="Split reproducibility")
+                train_seed_in=gr.Number(label="Train seed",value=2025,precision=0,info="Augmentation reproducibility")
+            nw_in=gr.Slider(minimum=0,maximum=8,step=1,value=2,
+                            label="DataLoader workers",
+                            info="0 = single process (safest, slowest). 2 = good for Colab. 4+ may crash with large videos.")
+            cache_local_cb=gr.Checkbox(label="Cache videos to local disk before training",value=True,
+                info="Copy from Drive to /content first (5-30× faster reads). Progress shown when training starts.")
 
-if __name__ == "__main__":
-    demo.launch(debug=True, share=True)
+            with gr.Accordion("🎨 Augmentation", open=False):
+                gr.Markdown("**Spatial** — applied to the whole window consistently")
+                aug_hflip_in=gr.Slider(minimum=0,maximum=1,step=0.05,value=0.5,
+                                       label="Horizontal flip probability",
+                                       info="0 = off, 0.5 = flip half the windows")
+                aug_vflip_in=gr.Slider(minimum=0,maximum=1,step=0.05,value=0.0,
+                                       label="Vertical flip probability",
+                                       info="Usually 0 for animal behavior (up/down matters)")
+                aug_rot_in=gr.Slider(minimum=0,maximum=30,step=1,value=0,
+                                     label="Rotation (± degrees)",
+                                     info="0 = off. Each window rotated by a random angle in this range")
+
+                gr.Markdown("**Photometric** — same factor per window")
+                aug_brightness_in=gr.Slider(minimum=0,maximum=0.5,step=0.05,value=0.0,
+                                            label="Brightness jitter (±)",info="0 = off")
+                aug_contrast_in=gr.Slider(minimum=0,maximum=0.5,step=0.05,value=0.0,
+                                          label="Contrast jitter (±)",info="0 = off")
+                aug_saturation_in=gr.Slider(minimum=0,maximum=0.5,step=0.05,value=0.0,
+                                            label="Saturation jitter (±)",info="0 = off")
+
+                gr.Markdown("**Per-frame** — random subset of frames in each window")
+                aug_blur_in=gr.Slider(minimum=0,maximum=1,step=0.05,value=0.35,
+                                      label="Random blur fraction",
+                                      info="Fraction of frames to Gaussian-blur. 0 = off")
+                aug_tdrop_in=gr.Slider(minimum=0,maximum=0.5,step=0.05,value=0.15,
+                                       label="Temporal dropout fraction",
+                                       info="Fraction of frames replaced by a neighbor. 0 = off")
+
+                gr.Markdown("**Class balancing** — show selected classes more often per epoch")
+                aug_mult_in=gr.Slider(minimum=1,maximum=10,step=1,value=1,
+                                      label="Copies per window",
+                                      info="1 = off. 3 = each window seen 3× per epoch, each pass with fresh online augmentation. Epoch time scales linearly.")
+                aug_excluded_in=gr.CheckboxGroup(choices=[],value=[],
+                                                 label="Do NOT multiply these classes",
+                                                 info="Typically exclude majority classes like 'Other' so minority classes become relatively more frequent. Updates when you change label mapping.")
+
+            train_btn=gr.Button("🚀 Start training",variant="primary",size="lg")
+            gr.Markdown("---")
+            gr.Markdown("### ④ Validation results")
+            val_html=gr.HTML("<p style='color:#aaa;'>Training not started</p>")
+
+    # ===== WIRING =====
+
+    demo.load(list_models,[repo_in],[model_dd,model_st])
+    load_btn.click(load_pretrained,[repo_in,model_dd],[model_st,ws_in])
+
+    # Scan outputs: status, dist, nav, N dropdown updates, vid_dd, img, info, tl, scrubber, cursor, vid_list, summary
+    scan_outputs = [scan_st, label_dist_html, nav_md, *map_dds, vid_dd,
+                    frame_img, info_html, timeline_html, scrubber, cursor_state, vid_list_html, mapping_summary]
+
+    # Class-balancing excluded-classes checkbox: keep choices in sync with current
+    # training classes (new_names). Defined early so scan_d.click().then(...) can reference it.
+    def _update_excluded_choices(head_mode, *dd_vals):
+        data_labels = S["label_names"]
+        pretrained_names = S["cfg"]["class_names"] if S["cfg"] else []
+        if not data_labels:
+            return gr.update(choices=[], value=[])
+        vals = list(dd_vals[:len(data_labels)])
+        new_names, _ = compute_label_map_from_dropdowns(head_mode, vals, data_labels, pretrained_names)
+        prev = dd_vals[-1] if dd_vals else []
+        prev = list(prev) if prev else []
+        default_excluded = [n for n in new_names if n.lower() in ("other","others")]
+        kept = [v for v in prev if v in new_names]
+        value = kept if kept else default_excluded
+        return gr.update(choices=list(new_names), value=value)
+
+    # Demo button → download from HF + auto-scan (same outputs as Load folder, paths stay untouched)
+    demo_btn.click(load_demo_training, [repo_in, vr_in, val_seed_in, head_mode_dd, *map_dds], scan_outputs
+                   ).then(_update_excluded_choices,
+                          [head_mode_dd, *map_dds, aug_excluded_in], aug_excluded_in)
+
+    # Load folder → scan user's own directories
+    scan_d.click(do_scan_and_preview, [vdir_in, ldir_in, vr_in, val_seed_in, head_mode_dd, *map_dds], scan_outputs
+                 ).then(_update_excluded_choices,
+                        [head_mode_dd, *map_dds, aug_excluded_in], aug_excluded_in)
+
+    # Head mode change → rebuild all mapping dropdowns + timeline + summary
+    map_change_outputs = [*map_dds, timeline_html, cursor_state, mapping_summary]
+    head_mode_dd.change(on_head_mode_change, [head_mode_dd, *map_dds], map_change_outputs)
+
+    # Any mapping dropdown change → rebuild others + timeline + summary
+    for dd in map_dds:
+        dd.change(on_mapping_change, [head_mode_dd, *map_dds], map_change_outputs)
+
+    # Keep excluded-classes checkbox in sync on mapping / head-mode changes
+    head_mode_dd.change(_update_excluded_choices,
+                        [head_mode_dd, *map_dds, aug_excluded_in], aug_excluded_in)
+    for dd in map_dds:
+        dd.change(_update_excluded_choices,
+                  [head_mode_dd, *map_dds, aug_excluded_in], aug_excluded_in)
+
+    # Val ratio or val seed change → recompute split
+    vr_in.change(on_val_ratio_change,[vr_in,val_seed_in],[vid_list_html])
+    val_seed_in.change(on_val_ratio_change,[vr_in,val_seed_in],[vid_list_html])
+
+    # Video dropdown → preview with mapping
+    vid_dd.change(on_vid_change,[vid_dd, head_mode_dd, *map_dds],
+                  [frame_img,info_html,timeline_html,scrubber,cursor_state,vid_list_html,nav_md])
+
+    # Scrubber
+    scrubber.input(fn=None,inputs=[scrubber,cursor_state],outputs=[scrubber],js=CURSOR_JS)
+    scrubber.change(on_scrub,[scrubber, head_mode_dd, *map_dds],[frame_img,info_html])
+
+    # Nav
+    prev_btn.click(lambda hm,*dd: do_nav("prev",hm,*dd),[head_mode_dd,*map_dds],
+                   [frame_img,info_html,timeline_html,scrubber,cursor_state,nav_md,vid_list_html])
+    next_btn.click(lambda hm,*dd: do_nav("next",hm,*dd),[head_mode_dd,*map_dds],
+                   [frame_img,info_html,timeline_html,scrubber,cursor_state,nav_md,vid_list_html])
+
+    # Training — pass head_mode + all mapping dropdowns instead of label_cb
+    train_btn.click(run_training,
+                    [repo_in,model_dd,vdir_in,ldir_in,odir_in,head_mode_dd,
+                     ep_in,bs_in,lr_in,vr_in,ws_in,st_in,val_seed_in,train_seed_in,
+                     nw_in,cache_local_cb,
+                     aug_blur_in,aug_tdrop_in,aug_hflip_in,aug_vflip_in,
+                     aug_rot_in,aug_brightness_in,aug_contrast_in,aug_saturation_in,
+                     aug_mult_in,aug_excluded_in,
+                     *map_dds],
+                    [progress_html,val_html])
+
+demo.launch(debug=True,share=True)
