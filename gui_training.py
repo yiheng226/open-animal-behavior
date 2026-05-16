@@ -435,28 +435,6 @@ BUILTIN_MODELS = {
             "normalize": {"mean":[0.485,0.456,0.406],"std":[0.229,0.224,0.225]},
         },
     },
-    "[BUILTIN] Swin3D-B (K400)": {
-        "backbone": {
-            "name": "CustomSwin3D",
-            "variant": "b",
-            "source": "torchvision",
-            "pretrained": "Swin3D_B_Weights.KINETICS400_V1",
-            "hidden_size": 1024,
-            "num_frames": 16,
-            "input_size": 224,
-        },
-        "head": {
-            "type": "MLPHead", "in_features": 1024, "hidden_dim": 512,
-            "dropout": 0.3, "activation": "ReLU", "norm": "LayerNorm",
-            "pool": "temporal_mean",
-        },
-        "num_classes": 0,
-        "class_names": [],
-        "input_format": {
-            "shape": "(B, C, T, H, W)", "C": 3, "T": 16, "H": 224, "W": 224,
-            "normalize": {"mean":[0.485,0.456,0.406],"std":[0.229,0.224,0.225]},
-        },
-    },
     "[BUILTIN] TimeSformer-B (K400)": {
         "backbone": {
             "name": "TimesformerModel",
@@ -489,27 +467,6 @@ BUILTIN_MODELS = {
         },
         "head": {
             "type": "MLPHead", "in_features": 384, "hidden_dim": 512,
-            "dropout": 0.1, "activation": "ReLU", "norm": "LayerNorm",
-            "pool": "sequence_mean",
-        },
-        "num_classes": 0,
-        "class_names": [],
-        "input_format": {
-            "shape": "(B, C, T, H, W)", "C": 3, "T": 16, "H": 224, "W": 224,
-            "normalize": {"mean":[0.485,0.456,0.406],"std":[0.229,0.224,0.225]},
-        },
-    },
-    "[BUILTIN] VideoMAE ViT-B (K400)": {
-        "backbone": {
-            "name": "VideoMAEModel",
-            "source": "huggingface",
-            "pretrained": "MCG-NJU/videomae-base-finetuned-kinetics",
-            "hidden_size": 768,
-            "num_frames": 16,
-            "input_size": 224,
-        },
-        "head": {
-            "type": "MLPHead", "in_features": 768, "hidden_dim": 512,
             "dropout": 0.1, "activation": "ReLU", "norm": "LayerNorm",
             "pool": "sequence_mean",
         },
