@@ -2,8 +2,8 @@
 
 # ==================== 👇 修改這裡 👇 ====================
 HF_REPO_ID = "yiheng266/animal-social-models"
-DEFAULT_VIDEO_DIR = "/content/drive/My Drive/traindata/kuo_validation/video(s and g)/video/train"
-DEFAULT_LABEL_DIR = "/content/drive/My Drive/traindata/kuo_validation/video(s and g)/onehot"
+DEFAULT_VIDEO_DIR = "/content/drive/My Drive/videos/train/"
+DEFAULT_LABEL_DIR = "/content/drive/My Drive/labels/train/"
 DEFAULT_OUTPUT_DIR = "/content/drive/My Drive/trained_models/"
 MAX_LABELS = 15  # pre-built dropdown slots
 # ==================== 👆 修改以上即可 👆 ====================
@@ -79,10 +79,16 @@ class CustomTimeSformer(nn.Module):
         return self.head(self.backbone(pixel_values=x).last_hidden_state[:,0])
 
 class CustomSwin3D(nn.Module):
+    """Swin3D — supports both swin3d_t and swin3d_b via cfg["backbone"]["variant"]."""
     def __init__(self, cfg):
         super().__init__()
-        from torchvision.models.video import swin3d_t, Swin3D_T_Weights
-        self.model=swin3d_t(weights=Swin3D_T_Weights.DEFAULT)
+        variant = cfg["backbone"].get("variant", "t").lower()
+        if variant == "b":
+            from torchvision.models.video import swin3d_b, Swin3D_B_Weights
+            self.model = swin3d_b(weights=Swin3D_B_Weights.DEFAULT)
+        else:
+            from torchvision.models.video import swin3d_t, Swin3D_T_Weights
+            self.model = swin3d_t(weights=Swin3D_T_Weights.DEFAULT)
         self.model.head=nn.Identity(); self.model.avgpool=nn.Identity()
         self.head=MLPHead_TM(cfg["head"]["in_features"],cfg["num_classes"],cfg["head"]["hidden_dim"],cfg["head"]["dropout"])
     def forward(self,x):
@@ -90,17 +96,41 @@ class CustomSwin3D(nn.Module):
         x=self.model.features(x); x=self.model.norm(x); x=x.mean(dim=(2,3))
         return self.head(x)
 
+class CustomVideoMAE(nn.Module):
+    """VideoMAE backbone (ViT-S / ViT-B / ViT-L) via HuggingFace.
+    Input: (B, C, T, H, W). VideoMAE expects (B, T, C, H, W) so we permute first.
+    Output is (B, seq_len, hidden_size); MLPHead_TM averages over seq_len."""
+    def __init__(self, cfg):
+        super().__init__()
+        from transformers import VideoMAEModel
+        self.backbone = VideoMAEModel.from_pretrained(cfg["backbone"]["pretrained"])
+        self.head = MLPHead_TM(
+            cfg["head"]["in_features"], cfg["num_classes"],
+            cfg["head"]["hidden_dim"], cfg["head"]["dropout"]
+        )
+    def forward(self, x):
+        x = x.permute(0, 2, 1, 3, 4)  # (B,C,T,H,W) -> (B,T,C,H,W)
+        out = self.backbone(pixel_values=x).last_hidden_state  # (B, seq_len, hidden_size)
+        return self.head(out)  # MLPHead_TM averages over dim=1
+
 def build_model(cfg):
     n=cfg["backbone"]["name"]
     if n=="TimesformerModel": return CustomTimeSformer(cfg)
     elif n=="CustomSwin3D": return CustomSwin3D(cfg)
+    elif n=="VideoMAEModel": return CustomVideoMAE(cfg)
     else: raise ValueError(f"Unknown backbone: {n}")
 
 def rebuild_head(model, cfg, new_nc):
     hd=cfg["head"]["hidden_dim"]; dr=cfg["head"]["dropout"]; inf=cfg["head"]["in_features"]
     pool=cfg["head"].get("pool","cls_token")
-    if pool=="temporal_mean": model.head=MLPHead_TM(inf,new_nc,hd,dr)
-    else: model.head=MLPHead_CLS(inf,new_nc,hd,dr)
+    # temporal_mean and sequence_mean both use MLPHead_TM (mean over dim=1).
+    # The names differ for documentation (Swin3D averages temporal+spatial inside
+    # the backbone leaving a (B, hidden) tensor before head, so its "pool" is
+    # cosmetic; VideoMAE outputs (B, seq, hidden) so MLPHead_TM averages seq).
+    if pool in ("temporal_mean", "sequence_mean"):
+        model.head=MLPHead_TM(inf,new_nc,hd,dr)
+    else:
+        model.head=MLPHead_CLS(inf,new_nc,hd,dr)
     return model
 
 # ====================== Preprocess + Augmentation ======================
@@ -386,6 +416,7 @@ BUILTIN_MODELS = {
     "[BUILTIN] Swin3D-T (K400)": {
         "backbone": {
             "name": "CustomSwin3D",
+            "variant": "t",
             "source": "torchvision",
             "pretrained": "Swin3D_T_Weights.DEFAULT",
             "hidden_size": 768,
@@ -394,6 +425,28 @@ BUILTIN_MODELS = {
         },
         "head": {
             "type": "MLPHead", "in_features": 768, "hidden_dim": 512,
+            "dropout": 0.3, "activation": "ReLU", "norm": "LayerNorm",
+            "pool": "temporal_mean",
+        },
+        "num_classes": 0,
+        "class_names": [],
+        "input_format": {
+            "shape": "(B, C, T, H, W)", "C": 3, "T": 16, "H": 224, "W": 224,
+            "normalize": {"mean":[0.485,0.456,0.406],"std":[0.229,0.224,0.225]},
+        },
+    },
+    "[BUILTIN] Swin3D-B (K400)": {
+        "backbone": {
+            "name": "CustomSwin3D",
+            "variant": "b",
+            "source": "torchvision",
+            "pretrained": "Swin3D_B_Weights.KINETICS400_V1",
+            "hidden_size": 1024,
+            "num_frames": 16,
+            "input_size": 224,
+        },
+        "head": {
+            "type": "MLPHead", "in_features": 1024, "hidden_dim": 512,
             "dropout": 0.3, "activation": "ReLU", "norm": "LayerNorm",
             "pool": "temporal_mean",
         },
@@ -422,6 +475,48 @@ BUILTIN_MODELS = {
         "class_names": [],
         "input_format": {
             "shape": "(B, C, T, H, W)", "C": 3, "T": 8, "H": 224, "W": 224,
+            "normalize": {"mean":[0.485,0.456,0.406],"std":[0.229,0.224,0.225]},
+        },
+    },
+    "[BUILTIN] VideoMAE ViT-S (K400)": {
+        "backbone": {
+            "name": "VideoMAEModel",
+            "source": "huggingface",
+            "pretrained": "MCG-NJU/videomae-small-finetuned-kinetics",
+            "hidden_size": 384,
+            "num_frames": 16,
+            "input_size": 224,
+        },
+        "head": {
+            "type": "MLPHead", "in_features": 384, "hidden_dim": 512,
+            "dropout": 0.1, "activation": "ReLU", "norm": "LayerNorm",
+            "pool": "sequence_mean",
+        },
+        "num_classes": 0,
+        "class_names": [],
+        "input_format": {
+            "shape": "(B, C, T, H, W)", "C": 3, "T": 16, "H": 224, "W": 224,
+            "normalize": {"mean":[0.485,0.456,0.406],"std":[0.229,0.224,0.225]},
+        },
+    },
+    "[BUILTIN] VideoMAE ViT-B (K400)": {
+        "backbone": {
+            "name": "VideoMAEModel",
+            "source": "huggingface",
+            "pretrained": "MCG-NJU/videomae-base-finetuned-kinetics",
+            "hidden_size": 768,
+            "num_frames": 16,
+            "input_size": 224,
+        },
+        "head": {
+            "type": "MLPHead", "in_features": 768, "hidden_dim": 512,
+            "dropout": 0.1, "activation": "ReLU", "norm": "LayerNorm",
+            "pool": "sequence_mean",
+        },
+        "num_classes": 0,
+        "class_names": [],
+        "input_format": {
+            "shape": "(B, C, T, H, W)", "C": 3, "T": 16, "H": 224, "W": 224,
             "normalize": {"mean":[0.485,0.456,0.406],"std":[0.229,0.224,0.225]},
         },
     },
@@ -1409,7 +1504,7 @@ def load_demo_training(repo, val_pct, val_seed, head_mode, *dd_vals):
 # ====================== GUI ======================
 
 with gr.Blocks(title="Training", theme=YELLOW_THEME) as demo:
-    gr.Markdown("# 🏋️ Animal Behavior Model Training")
+    gr.Markdown("# Animal Behavior Model Training")
     gr.Markdown("Fine-tune from pretrained — preview labels & configure mapping before training")
 
     cursor_state = gr.Textbox(value=S["_cursor_data"], visible=False)
@@ -1424,9 +1519,12 @@ with gr.Blocks(title="Training", theme=YELLOW_THEME) as demo:
             model_st=gr.Textbox(label="Status",interactive=False,lines=4)
             gr.Markdown("---")
             gr.Markdown("### ② Load data")
-            vdir_in=gr.Textbox(label="Video directory",value=DEFAULT_VIDEO_DIR)
-            ldir_in=gr.Textbox(label="Label directory",value=DEFAULT_LABEL_DIR)
-            odir_in=gr.Textbox(label="Output directory",value=DEFAULT_OUTPUT_DIR)
+            vdir_in=gr.Textbox(label="Video directory",value=DEFAULT_VIDEO_DIR,
+                placeholder="e.g. /content/drive/My Drive/videos/train/")
+            ldir_in=gr.Textbox(label="Label directory",value=DEFAULT_LABEL_DIR,
+                placeholder="e.g. /content/drive/My Drive/labels/")
+            odir_in=gr.Textbox(label="Output directory",value=DEFAULT_OUTPUT_DIR,
+                placeholder="e.g. /content/drive/My Drive/trained_models/")
             demo_btn=gr.Button("🎯 Load Demo",variant="secondary",size="sm")
             scan_d=gr.Button("📂 Load folder",variant="secondary")
             scan_st=gr.Textbox(label="Folder status",interactive=False,lines=1)
