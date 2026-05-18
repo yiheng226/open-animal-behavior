@@ -497,37 +497,30 @@ def list_models(repo):
     return gr.update(choices=names, value=names[0] if names else None), msg
 
 def load_pretrained(repo, mname):
-    """Returns (status_text, window_update) — window slider auto-syncs to
-    the backbone's native num_frames so temporal weights align with pretrain."""
+    """Returns status_text. Window is fixed at 16, stride at 4."""
     if not mname:
-        return "❌ Select a model first", gr.update()
+        return "❌ Select a model first"
     try:
         # ----- Built-in path: build fresh from local torchvision / HF cache -----
         if mname in BUILTIN_MODELS:
             import copy as _copy
             cfg = _copy.deepcopy(BUILTIN_MODELS[mname])
-            # build_model needs a valid num_classes (>=1) to construct the head.
-            # We use a throwaway value of 1; rebuild_head() at train time will
-            # replace the head with the correct new_nc from the user's data.
             cfg["num_classes"] = 1
             model = build_model(cfg)
             model.to(device)
-            # Clear class_names / num_classes so the GUI forces "New head" logic
-            # (compute_label_map_from_dropdowns falls back to new-head branch
-            # when pretrained_names is empty).
             cfg["num_classes"] = 0
             cfg["class_names"] = []
             S.update({"model": model, "cfg": cfg, "train_log": []})
             nf = cfg["backbone"]["num_frames"]
             return (f"✅ Loaded: {mname}\n"
                     f"  Backbone: {cfg['backbone']['name']}\n"
-                    f"  Window auto-set to {nf} frames\n"
+                    f"  Window: 16 frames · Stride: 4 · Model frames: {nf}\n"
                     f"  No pretrained head — use 'New head' mode\n"
-                    f"  Device: {device}"), gr.update(value=nf)
+                    f"  Device: {device}")
 
         # ----- HF repo path (existing behaviour) -----
         if not repo:
-            return "❌ Specify repo for HF model", gr.update()
+            return "❌ Specify repo for HF model"
         if not mname.endswith(".pth"): cf=f"{mname}/config.json"; pf=f"{mname}/model.pth"
         else: cf="config.json"; pf=mname
         with open(hf_hub_download(repo_id=repo,filename=cf)) as f: cfg=json.load(f)
@@ -536,11 +529,11 @@ def load_pretrained(repo, mname):
         model.to(device); S.update({"model":model,"cfg":cfg,"train_log":[]})
         nf = cfg["backbone"].get("num_frames", 16)
         return (f"✅ Loaded: {mname}\n  Backbone: {cfg['backbone']['name']}\n"
-                f"  Classes: {cfg['class_names']}\n  Window auto-set to {nf} frames\n"
-                f"  Device: {device}"), gr.update(value=nf)
+                f"  Classes: {cfg['class_names']}\n  Window: 16 · Stride: 4 · Model frames: {nf}\n"
+                f"  Device: {device}")
     except Exception as e:
         traceback.print_exc()
-        return f"❌ {e}", gr.update()
+        return f"❌ {e}"
 
 # ====================== Train/Val Split ======================
 
@@ -1164,7 +1157,7 @@ def cancel_training():
     return "<p style='color:#e74c3c;font-weight:600;'>⛔ Cancelling… will stop after current batch.</p>"
 
 def run_training(repo,mname,vdir,ldir,odir,head_mode,
-                 n_epochs,batch_sz,lr_str,val_pct,ws,stride_val,val_seed,train_seed,
+                 n_epochs,batch_sz,lr_str,val_pct,val_seed,train_seed,
                  num_workers,cache_local,
                  aug_blur_frac,aug_tdrop_frac,aug_hflip_p,aug_vflip_p,
                  aug_rot_deg,aug_brightness,aug_contrast,aug_saturation,
@@ -1173,7 +1166,9 @@ def run_training(repo,mname,vdir,ldir,odir,head_mode,
     S["_cancel_training"] = False
     try:
         lr=float(lr_str); val_ratio=float(val_pct)/100.0; n_epochs=int(n_epochs)
-        batch_sz=int(batch_sz); ws=int(ws); stride_val=int(stride_val)
+        batch_sz=int(batch_sz)
+        ws=16; stride_val=4  # fixed window and stride
+        val_seed=int(val_seed); train_seed=int(train_seed)
         val_seed=int(val_seed); train_seed=int(train_seed)
         num_workers=int(num_workers)
         aug_blur_frac=float(aug_blur_frac); aug_tdrop_frac=float(aug_tdrop_frac)
@@ -1551,9 +1546,7 @@ with gr.Blocks(title="Training", theme=YELLOW_THEME) as demo:
                 bs_in=gr.Number(label="Batch",value=8,precision=0)
             with gr.Row():
                 lr_in=gr.Textbox(label="LR",value="3.8e-5")
-            with gr.Row():
-                ws_in=gr.Number(label="Window",value=16,precision=0)
-                st_in=gr.Number(label="Stride",value=4,precision=0)
+            gr.HTML("<div style='font-size:12px;color:#555;padding:6px 10px;background:#f7f7f7;border-radius:6px;margin:4px 0;'><b>Window:</b> 16 frames &nbsp;·&nbsp; <b>Stride:</b> 4 frames (fixed)</div>")
             with gr.Row():
                 val_seed_in=gr.Number(label="Val seed",value=1337,precision=0,info="Split reproducibility")
                 train_seed_in=gr.Number(label="Train seed",value=2025,precision=0,info="Augmentation reproducibility")
@@ -1609,7 +1602,7 @@ with gr.Blocks(title="Training", theme=YELLOW_THEME) as demo:
     # ===== WIRING =====
 
     demo.load(list_models,[repo_in],[model_dd,model_st])
-    load_btn.click(load_pretrained,[repo_in,model_dd],[model_st,ws_in])
+    load_btn.click(load_pretrained,[repo_in,model_dd],[model_st])
 
     # Scan outputs: status, dist, nav, N dropdown updates, vid_dd, img, info, tl, scrubber, cursor, vid_list, summary
     scan_outputs = [scan_st, label_dist_html, nav_md, *map_dds, vid_dd,
@@ -1677,7 +1670,7 @@ with gr.Blocks(title="Training", theme=YELLOW_THEME) as demo:
     # Training — pass head_mode + all mapping dropdowns instead of label_cb
     train_btn.click(run_training,
                     [repo_in,model_dd,vdir_in,ldir_in,odir_in,head_mode_dd,
-                     ep_in,bs_in,lr_in,vr_in,ws_in,st_in,val_seed_in,train_seed_in,
+                     ep_in,bs_in,lr_in,vr_in,val_seed_in,train_seed_in,
                      nw_in,cache_local_cb,
                      aug_blur_in,aug_tdrop_in,aug_hflip_in,aug_vflip_in,
                      aug_rot_in,aug_brightness_in,aug_contrast_in,aug_saturation_in,
