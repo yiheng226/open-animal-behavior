@@ -273,7 +273,7 @@ def scan_videos_and_preview(vdir):
 
 # ====================== HTML Builders ======================
 
-def html_progress(vd, vt, cur_name, wd, wt, ws=None, elapsed=None, total_frames=None):
+def html_progress(vd, vt, cur_name, wd, wt, ws=None, elapsed=None, stride=4):
     if vt == 0: return ""
     vp = (vd / vt) * 100; wp = (wd / max(wt, 1)) * 100
     vc = "#1D9E75" if vd == vt else "#D85A30"
@@ -281,11 +281,8 @@ def html_progress(vd, vt, cur_name, wd, wt, ws=None, elapsed=None, total_frames=
     rate_str = ""
     if elapsed and elapsed > 0.1 and wd > 0:
         wps = wd / elapsed
-        if total_frames and total_frames > 0:
-            real_fps = total_frames / elapsed
-            rate_str = f" · {wps:.1f} win/s · {real_fps:.1f} fps"
-        else:
-            rate_str = f" · {wps:.1f} win/s"
+        fps = wd * stride / elapsed
+        rate_str = f" · {wps:.1f} win/s · {fps:.1f} fps"
     return f"""<div style="background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:10px 14px;">
       <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
         <span style="font-size:13px;font-weight:600;">Batch — {st}</span>
@@ -514,13 +511,6 @@ def run_single(vf, num_workers, cache_local):
             infer_vdir = os.path.dirname(cached)
             yield "<p style='font-size:13px;color:#888;'>📦 Cached to local disk</p>", U, U, U, U, U, U, U, U
 
-    # Get total frames for fps calculation
-    try:
-        _vr = VideoReader(os.path.join(infer_vdir, vf), ctx=cpu(0))
-        vid_total_frames = len(_vr); del _vr
-    except:
-        vid_total_frames = None
-
     t0 = time.perf_counter()
     result = None
     for msg in infer_video_gen(infer_vdir, vf, S["model"], S["cfg"], S["disabled_classes"]):
@@ -531,7 +521,7 @@ def run_single(vf, num_workers, cache_local):
         if isinstance(msg, dict): result = msg
         else:
             wd, wt = msg
-            yield html_progress(0, 1, vf, wd, wt, ws=ws, elapsed=time.perf_counter()-t0, total_frames=vid_total_frames), U, U, U, U, U, U, U, U
+            yield html_progress(0, 1, vf, wd, wt, ws=ws, elapsed=time.perf_counter()-t0), U, U, U, U, U, U, U, U
     # Store result with original video path so frame preview works
     if result and cache_local:
         result["video_path"] = os.path.join(vdir, vf)
@@ -577,12 +567,6 @@ def run_batch(num_workers, cache_local):
             print(f"⛔ Batch inference cancelled at video {vi}/{total}")
             return
         infer_vdir = cache_map.get(vf, vdir)
-        # Get total frames for fps calculation
-        try:
-            _vr = VideoReader(os.path.join(infer_vdir, vf), ctx=cpu(0))
-            vid_total_frames = len(_vr); del _vr
-        except:
-            vid_total_frames = None
         t0 = time.perf_counter()
         result = None
         for msg in infer_video_gen(infer_vdir, vf, S["model"], S["cfg"], S["disabled_classes"]):
@@ -594,7 +578,7 @@ def run_batch(num_workers, cache_local):
             if isinstance(msg, dict): result = msg
             else:
                 wd, wt = msg
-                yield html_progress(vi, total, vf, wd, wt, ws=ws, elapsed=time.perf_counter()-t0, total_frames=vid_total_frames), U, U, U, U, U, U, U, U, U
+                yield html_progress(vi, total, vf, wd, wt, ws=ws, elapsed=time.perf_counter()-t0), U, U, U, U, U, U, U, U, U
         # Store with original path for frame preview
         if result and vf in cache_map:
             result["video_path"] = os.path.join(vdir, vf)
