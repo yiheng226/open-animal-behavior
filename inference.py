@@ -116,7 +116,7 @@ def infer_video_gen(vdir, vf, model, cfg, disabled_classes=None, yield_every=5):
 
     device = next(model.parameters()).device
     ws = cfg["backbone"]["num_frames"]   # window size
-    st = max(1, ws // 4)                 # stride
+    st = 4                               # stride (fixed)
     nc = cfg["num_classes"]
 
     import os
