@@ -396,7 +396,8 @@ class SlidingWindowDataset(Dataset):
 # ====================== State ======================
 
 S = {"model":None,"cfg":None,"scan_data":None,"label_names":[],"cur_vf":None,"cur_vr":None,
-     "_cursor_data":json.dumps({"T":0,"names":[],"labels":[]}),"train_log":[],"split_indices":{"train":[],"val":[]}}
+     "_cursor_data":json.dumps({"T":0,"names":[],"labels":[]}),"train_log":[],"split_indices":{"train":[],"val":[]},
+     "_cancel_training":False}
 
 CLR_PAL=["#378ADD","#D85A30","#E24B4A","#7F77DD","#1D9E75","#BA7517",
          "#534AB7","#993C1D","#639922","#D4537E","#185FA5","#854F0B","#A32D2D"]
@@ -1157,6 +1158,10 @@ def build_val_html(log,names):
 
 # ====================== Training ======================
 
+def cancel_training():
+    S["_cancel_training"] = True
+    return "<p style='color:#e74c3c;font-weight:600;'>⛔ Cancelling… will stop after current batch.</p>"
+
 def run_training(repo,mname,vdir,ldir,odir,head_mode,
                  n_epochs,batch_sz,lr_str,val_pct,ws,stride_val,val_seed,train_seed,
                  num_workers,cache_local,
@@ -1164,6 +1169,7 @@ def run_training(repo,mname,vdir,ldir,odir,head_mode,
                  aug_rot_deg,aug_brightness,aug_contrast,aug_saturation,
                  aug_mult,aug_excluded_classes,
                  *dd_vals):
+    S["_cancel_training"] = False
     try:
         lr=float(lr_str); val_ratio=float(val_pct)/100.0; n_epochs=int(n_epochs)
         batch_sz=int(batch_sz); ws=int(ws); stride_val=int(stride_val)
@@ -1215,6 +1221,10 @@ def run_training(repo,mname,vdir,ldir,odir,head_mode,
         # Show 0/N immediately so user knows something started
         yield html_cache_progress(0, n_total, data[used_idxs[0]]["vf"]),"<p style='color:#aaa;'>Caching...</p>"
         for i, di in enumerate(used_idxs):
+            if S["_cancel_training"]:
+                yield "<p style='color:#e74c3c;font-weight:600;'>⛔ Training cancelled by user.</p>", U
+                print("⛔ Training cancelled by user.")
+                return
             d = data[di]
             src_path = d["vp"]
             # Only cache if source is not already inside the cache dir (avoids
@@ -1310,9 +1320,17 @@ def run_training(repo,mname,vdir,ldir,odir,head_mode,
     S["train_log"]=[]
 
     for ep in range(n_epochs):
+        if S["_cancel_training"]:
+            yield "<p style='color:#e74c3c;font-weight:600;'>⛔ Training cancelled by user.</p>", U
+            print("⛔ Training cancelled by user.")
+            return
         model.train(); rl=0.0; optimizer.zero_grad(set_to_none=True); nb=len(train_loader)
         ep_t0=time.perf_counter()
         for bi,(vids,tgts) in enumerate(train_loader):
+            if S["_cancel_training"]:
+                yield "<p style='color:#e74c3c;font-weight:600;'>⛔ Training cancelled by user.</p>", U
+                print("⛔ Training cancelled by user.")
+                return
             vids=vids.to(device); tgts=tgts.to(device)
             with autocast(): loss=criterion(model(vids),tgts)/accum
             scaler.scale(loss).backward()
@@ -1578,7 +1596,9 @@ with gr.Blocks(title="Training", theme=YELLOW_THEME) as demo:
                                                  label="Do NOT multiply these classes",
                                                  info="Typically exclude majority classes like 'Other' so minority classes become relatively more frequent. Updates when you change label mapping.")
 
-            train_btn=gr.Button("🚀 Start training",variant="primary",size="lg")
+            with gr.Row():
+                train_btn=gr.Button("🚀 Start training",variant="primary",size="lg")
+                cancel_btn=gr.Button("⛔ Cancel training",variant="stop",size="lg")
             gr.Markdown("---")
             gr.Markdown("### ④ Validation results")
             val_html=gr.HTML("<p style='color:#aaa;'>Training not started</p>")
@@ -1661,5 +1681,6 @@ with gr.Blocks(title="Training", theme=YELLOW_THEME) as demo:
                      aug_mult_in,aug_excluded_in,
                      *map_dds],
                     [progress_html,val_html])
+    cancel_btn.click(cancel_training, [], [progress_html])
 
 demo.launch(debug=True,share=True)
