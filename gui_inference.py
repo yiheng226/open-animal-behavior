@@ -34,7 +34,8 @@ print(f"Device: {device}")
 S = {"model": None, "cfg": None, "results": {}, "cur": None, "vr": None,
      "done": [], "idx": 0, "_active_vdir": None,
      "_cursor_data": json.dumps({"T": 0, "names": [], "labels": []}),
-     "model_source": None, "disabled_classes": set()}
+     "model_source": None, "disabled_classes": set(),
+     "_cancel_inference": False}
 
 CLR_PALETTE    = ["#378ADD","#D85A30","#E24B4A","#7F77DD","#1D9E75","#BA7517","#888780"]
 CLR_BG_PALETTE = ["rgba(55,138,221,0.9)","rgba(216,90,48,0.9)","rgba(226,75,74,0.9)",
@@ -467,7 +468,12 @@ def _full(vf, fi=0, vd=0, vt=0):
 
 # ====================== Actions ======================
 
+def cancel_inference():
+    S["_cancel_inference"] = True
+    return "<p style='color:#e74c3c;font-weight:600;'>⛔ Cancelling… will stop after current window.</p>"
+
 def run_single(vf):
+    S["_cancel_inference"] = False
     vdir = S.get("_active_vdir")
     if not S["model"]: yield "", "", None, "", "", "", "❌ Load model first", U, S["_cursor_data"]; return
     if not vf or not vdir: yield "", "", None, "", "", "", "❌ Select video", U, S["_cursor_data"]; return
@@ -475,6 +481,10 @@ def run_single(vf):
     t0 = time.perf_counter()
     result = None
     for msg in infer_video_gen(vdir, vf, S["model"], S["cfg"], S["disabled_classes"]):
+        if S["_cancel_inference"]:
+            yield "<p style='color:#e74c3c;font-weight:600;'>⛔ Inference cancelled.</p>", U, U, U, U, U, U, U, U
+            print(f"⛔ Inference cancelled: {vf}")
+            return
         if isinstance(msg, dict): result = msg
         else:
             wd, wt = msg
@@ -484,6 +494,7 @@ def run_single(vf):
     yield _full(vf, 0, 1, 1)
 
 def run_batch():
+    S["_cancel_inference"] = False
     vdir = S.get("_active_vdir")
     if not S["model"]: yield "", "", None, "", "", "", "❌ Load model first", U, S["_cursor_data"], ""; return
     if not vdir or not os.path.isdir(vdir): yield "", "", None, "", "", "", "❌ Load videos first", U, S["_cursor_data"], ""; return
@@ -492,9 +503,19 @@ def run_batch():
     ws = S["cfg"]["backbone"]["num_frames"] if S.get("cfg") else None
     total = len(vids); blog = []
     for vi, vf in enumerate(vids):
+        if S["_cancel_inference"]:
+            blog.append(f"⛔ Cancelled at video {vi}/{total}")
+            yield "<p style='color:#e74c3c;font-weight:600;'>⛔ Batch cancelled.</p>", U, U, U, U, U, U, U, U, "\n".join(blog)
+            print(f"⛔ Batch inference cancelled at video {vi}/{total}")
+            return
         t0 = time.perf_counter()  # reset timer per video for stable in-video rate
         result = None
         for msg in infer_video_gen(vdir, vf, S["model"], S["cfg"], S["disabled_classes"]):
+            if S["_cancel_inference"]:
+                blog.append(f"⛔ Cancelled during {vf}")
+                yield "<p style='color:#e74c3c;font-weight:600;'>⛔ Batch cancelled.</p>", U, U, U, U, U, U, U, U, "\n".join(blog)
+                print(f"⛔ Batch inference cancelled during {vf}")
+                return
             if isinstance(msg, dict): result = msg
             else:
                 wd, wt = msg
@@ -622,6 +643,7 @@ with gr.Blocks(title="Animal Behavior Inference", theme=GREEN_THEME) as demo:
             batch_btn = gr.Button("📦 Batch inference (all videos)", variant="primary", size="lg")
             batch_log_tb = gr.Textbox(label="Batch log", interactive=False, lines=8)
             run_btn = gr.Button("🚀 Run inference (single)", variant="secondary")
+            cancel_btn = gr.Button("⛔ Cancel inference", variant="stop")
 
         with gr.Column(scale=2, min_width=400):
             toggle_label_html = gr.HTML("<p style='color:#aaa;font-size:13px;'>Load a model to see behaviors</p>")
@@ -667,6 +689,7 @@ with gr.Blocks(title="Animal Behavior Inference", theme=GREEN_THEME) as demo:
 
     run_btn.click(run_single, [video_dd], out9)
     batch_btn.click(run_batch, [], out10)
+    cancel_btn.click(cancel_inference, [], [batch_prog])
     scrubber.input(fn=None, inputs=[scrubber, cursor_state], outputs=[scrubber], js=CURSOR_JS)
     scrubber.change(on_scrub, inputs=[scrubber], outputs=[frame_img, info_html])
     prev_btn.click(lambda: do_nav("prev"), [], out9)
