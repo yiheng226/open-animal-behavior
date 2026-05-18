@@ -5,7 +5,7 @@ Usage:
     python gui_inference.py
 """
 
-import os, json, time
+import os, json, time, shutil
 import numpy as np
 import torch
 import gradio as gr
@@ -25,6 +25,25 @@ DEFAULT_VIDEO_DIR  = "/content/drive/My Drive/videos/"
 DEFAULT_OUTPUT_DIR = "/content/drive/My Drive/results/"
 DEFAULT_LOCAL_MODEL_DIRS = []
 # ==================== 👆 修改以上即可 👆 ====================
+
+VIDEO_CACHE_DIR = os.path.join(os.path.expanduser("~"), "oab_inference_cache")
+
+def cache_video_to_local(src_path, cache_dir=VIDEO_CACHE_DIR):
+    """Copy src_path to cache_dir and return the local path."""
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        dst = os.path.join(cache_dir, os.path.basename(src_path))
+        if os.path.exists(dst):
+            try:
+                if os.path.getsize(dst) == os.path.getsize(src_path):
+                    return dst
+            except Exception:
+                pass
+        shutil.copy2(src_path, dst)
+        return dst
+    except Exception as e:
+        print(f"⚠️ Failed to cache {src_path}: {e}; falling back to original path")
+        return src_path
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
@@ -472,15 +491,25 @@ def cancel_inference():
     S["_cancel_inference"] = True
     return "<p style='color:#e74c3c;font-weight:600;'>⛔ Cancelling… will stop after current window.</p>"
 
-def run_single(vf):
+def run_single(vf, num_workers, cache_local):
     S["_cancel_inference"] = False
     vdir = S.get("_active_vdir")
     if not S["model"]: yield "", "", None, "", "", "", "❌ Load model first", U, S["_cursor_data"]; return
     if not vf or not vdir: yield "", "", None, "", "", "", "❌ Select video", U, S["_cursor_data"]; return
     ws = S["cfg"]["backbone"]["num_frames"] if S.get("cfg") else None
+
+    # Cache video to local if requested
+    infer_vdir = vdir
+    if cache_local:
+        vp = os.path.join(vdir, vf)
+        cached = cache_video_to_local(vp)
+        if cached != vp:
+            infer_vdir = os.path.dirname(cached)
+            yield "<p style='font-size:13px;color:#888;'>📦 Cached to local disk</p>", U, U, U, U, U, U, U, U
+
     t0 = time.perf_counter()
     result = None
-    for msg in infer_video_gen(vdir, vf, S["model"], S["cfg"], S["disabled_classes"]):
+    for msg in infer_video_gen(infer_vdir, vf, S["model"], S["cfg"], S["disabled_classes"]):
         if S["_cancel_inference"]:
             yield "<p style='color:#e74c3c;font-weight:600;'>⛔ Inference cancelled.</p>", U, U, U, U, U, U, U, U
             print(f"⛔ Inference cancelled: {vf}")
@@ -489,11 +518,14 @@ def run_single(vf):
         else:
             wd, wt = msg
             yield html_progress(0, 1, vf, wd, wt, ws=ws, elapsed=time.perf_counter()-t0), U, U, U, U, U, U, U, U
+    # Store result with original video path so frame preview works
+    if result and cache_local:
+        result["video_path"] = os.path.join(vdir, vf)
     S["results"][vf] = result
     if vf not in S["done"]: S["done"].append(vf)
     yield _full(vf, 0, 1, 1)
 
-def run_batch():
+def run_batch(num_workers, cache_local):
     S["_cancel_inference"] = False
     vdir = S.get("_active_vdir")
     if not S["model"]: yield "", "", None, "", "", "", "❌ Load model first", U, S["_cursor_data"], ""; return
@@ -502,15 +534,38 @@ def run_batch():
     if not vids: yield "", "", None, "", "", "", "❌ No videos", U, S["_cursor_data"], ""; return
     ws = S["cfg"]["backbone"]["num_frames"] if S.get("cfg") else None
     total = len(vids); blog = []
+
+    # Cache all videos upfront if requested
+    cache_map = {}  # vf -> cached dir
+    if cache_local:
+        cache_t0 = time.perf_counter()
+        for ci, vf in enumerate(vids):
+            if S["_cancel_inference"]:
+                blog.append(f"⛔ Cancelled during caching")
+                yield "<p style='color:#e74c3c;font-weight:600;'>⛔ Cancelled.</p>", U, U, U, U, U, U, U, U, "\n".join(blog)
+                return
+            vp = os.path.join(vdir, vf)
+            cached = cache_video_to_local(vp)
+            if cached != vp:
+                cache_map[vf] = os.path.dirname(cached)
+            mb = 0
+            try: mb = os.path.getsize(cached) / (1024*1024)
+            except: pass
+            elapsed = time.perf_counter() - cache_t0
+            yield (f"<p style='font-size:13px;color:#888;'>📦 Caching {ci+1}/{total}: {vf} ({mb:.0f} MB) · {elapsed:.0f}s</p>",
+                   U, U, U, U, U, U, U, U, U)
+        blog.append(f"📦 Cached {len(cache_map)} video(s) to local disk")
+
     for vi, vf in enumerate(vids):
         if S["_cancel_inference"]:
             blog.append(f"⛔ Cancelled at video {vi}/{total}")
             yield "<p style='color:#e74c3c;font-weight:600;'>⛔ Batch cancelled.</p>", U, U, U, U, U, U, U, U, "\n".join(blog)
             print(f"⛔ Batch inference cancelled at video {vi}/{total}")
             return
-        t0 = time.perf_counter()  # reset timer per video for stable in-video rate
+        infer_vdir = cache_map.get(vf, vdir)
+        t0 = time.perf_counter()
         result = None
-        for msg in infer_video_gen(vdir, vf, S["model"], S["cfg"], S["disabled_classes"]):
+        for msg in infer_video_gen(infer_vdir, vf, S["model"], S["cfg"], S["disabled_classes"]):
             if S["_cancel_inference"]:
                 blog.append(f"⛔ Cancelled during {vf}")
                 yield "<p style='color:#e74c3c;font-weight:600;'>⛔ Batch cancelled.</p>", U, U, U, U, U, U, U, U, "\n".join(blog)
@@ -520,6 +575,9 @@ def run_batch():
             else:
                 wd, wt = msg
                 yield html_progress(vi, total, vf, wd, wt, ws=ws, elapsed=time.perf_counter()-t0), U, U, U, U, U, U, U, U, U
+        # Store with original path for frame preview
+        if result and vf in cache_map:
+            result["video_path"] = os.path.join(vdir, vf)
         S["results"][vf] = result
         if vf not in S["done"]: S["done"].append(vf)
         blog.append(f"✅ {vf} ({result['total_frames']} fr)")
@@ -640,6 +698,12 @@ with gr.Blocks(title="Animal Behavior Inference", theme=GREEN_THEME) as demo:
             gr.Markdown("---")
             gr.Markdown("### ③ Inference")
             video_dd = gr.Dropdown(label="Select video", choices=[], interactive=True)
+            with gr.Accordion("⚙️ Advanced settings", open=False):
+                nw_in = gr.Slider(minimum=0, maximum=8, step=1, value=0,
+                                  label="Num workers (data loading)",
+                                  info="0 = main thread only. Windows: keep at 0 to avoid freezes.")
+                cache_local_cb = gr.Checkbox(label="Cache videos to local disk before inference", value=False,
+                                             info="Copies videos to local SSD first. Useful when reading from network/Drive.")
             batch_btn = gr.Button("📦 Batch inference (all videos)", variant="primary", size="lg")
             batch_log_tb = gr.Textbox(label="Batch log", interactive=False, lines=8)
             run_btn = gr.Button("🚀 Run inference (single)", variant="secondary")
@@ -687,8 +751,8 @@ with gr.Blocks(title="Animal Behavior Inference", theme=GREEN_THEME) as demo:
     out9 = [batch_prog, info_html, frame_img, timeline_html, behavior_html, exp_prev, nav_md_out, scrubber, cursor_state]
     out10 = out9 + [batch_log_tb]
 
-    run_btn.click(run_single, [video_dd], out9)
-    batch_btn.click(run_batch, [], out10)
+    run_btn.click(run_single, [video_dd, nw_in, cache_local_cb], out9)
+    batch_btn.click(run_batch, [nw_in, cache_local_cb], out10)
     cancel_btn.click(cancel_inference, [], [batch_prog])
     scrubber.input(fn=None, inputs=[scrubber, cursor_state], outputs=[scrubber], js=CURSOR_JS)
     scrubber.change(on_scrub, inputs=[scrubber], outputs=[frame_img, info_html])
