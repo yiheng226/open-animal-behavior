@@ -90,10 +90,10 @@ def _post_load_updates(cfg):
     names = cfg["class_names"]
     toggle_choices = [nm for nm in names if nm.lower() not in ("others", "other")]
     S["disabled_classes"] = set()
-    ws = cfg["backbone"]["num_frames"]
-    stride = 4  # fixed stride, matches inference.py
+    nf = cfg["backbone"]["num_frames"]
     info_html = (f"<div style='font-size:12px;color:#555;padding:6px 10px;background:#f7f7f7;border-radius:6px;'>"
-                 f"<b>Window:</b> {ws} frames &nbsp;·&nbsp; <b>Stride:</b> {stride} frames &nbsp;·&nbsp; "
+                 f"<b>Window:</b> 16 frames &nbsp;·&nbsp; <b>Stride:</b> 4 frames &nbsp;·&nbsp; "
+                 f"<b>Model frames:</b> {nf} &nbsp;·&nbsp; "
                  f"<b>Backbone:</b> {cfg['backbone']['name']}</div>")
     return (
         gr.update(choices=toggle_choices, value=toggle_choices, visible=True),
