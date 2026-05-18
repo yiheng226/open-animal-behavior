@@ -90,9 +90,15 @@ def _post_load_updates(cfg):
     names = cfg["class_names"]
     toggle_choices = [nm for nm in names if nm.lower() not in ("others", "other")]
     S["disabled_classes"] = set()
+    ws = cfg["backbone"]["num_frames"]
+    stride = 4  # fixed stride, matches inference.py
+    info_html = (f"<div style='font-size:12px;color:#555;padding:6px 10px;background:#f7f7f7;border-radius:6px;'>"
+                 f"<b>Window:</b> {ws} frames &nbsp;·&nbsp; <b>Stride:</b> {stride} frames &nbsp;·&nbsp; "
+                 f"<b>Backbone:</b> {cfg['backbone']['name']}</div>")
     return (
         gr.update(choices=toggle_choices, value=toggle_choices, visible=True),
         _html_behavior_toggles(cfg),
+        info_html,
     )
 
 def _html_behavior_toggles(cfg):
@@ -111,7 +117,7 @@ def _html_behavior_toggles(cfg):
 
 def load_model_hf(repo, model_name):
     if not model_name or not repo:
-        return "❌ Specify repo & model", U, ""
+        return "❌ Specify repo & model", U, "", ""
     try:
         if "/" in model_name or not model_name.endswith(".pth"):
             cfg_file = f"{model_name}/config.json"
@@ -123,37 +129,37 @@ def load_model_hf(repo, model_name):
             raw = json.load(f)
         cfg, err = normalize_config(raw)
         if err:
-            return f"❌ {err}", U, ""
+            return f"❌ {err}", U, "", ""
         pth_path = hf_hub_download(repo_id=repo, filename=pth_file)
         model = build_model_from_config(cfg)
         model.load_state_dict(torch.load(pth_path, map_location=device, weights_only=True))
         model.to(device).eval()
         S.update({"model": model, "cfg": cfg, "results": {}, "done": [], "cur": None, "vr": None, "model_source": "hf"})
-        toggle_upd, toggle_html = _post_load_updates(cfg)
+        toggle_upd, toggle_html, infer_info = _post_load_updates(cfg)
         return (f"✅ Loaded from HuggingFace!\n"
                 f"  Model: {model_name}\n"
                 f"  Backbone: {cfg['backbone']['name']} | Frames: {cfg['backbone']['num_frames']}\n"
                 f"  Classes ({len(cfg['class_names'])}): {cfg['class_names']}\n"
                 f"  Device: {device}",
-                toggle_upd, toggle_html)
+                toggle_upd, toggle_html, infer_info)
     except Exception as e:
-        return f"❌ {e}", U, ""
+        return f"❌ {e}", U, "", ""
 
 def load_model_local(local_dir, pth_name):
     if not pth_name or not local_dir:
-        return "❌ Select a local model", U, ""
+        return "❌ Select a local model", U, "", ""
     pth_path = os.path.join(local_dir, pth_name)
     if not os.path.exists(pth_path):
-        return f"❌ File not found: {pth_path}", U, ""
+        return f"❌ File not found: {pth_path}", U, "", ""
     try:
         cfg, cfg_source, err = find_config_for_pth(pth_path)
         if err:
-            return f"❌ {err}\n\n💡 Place a config.json or <name>_config.json in same folder.", U, ""
+            return f"❌ {err}\n\n💡 Place a config.json or <name>_config.json in same folder.", U, "", ""
         model = build_model_from_config(cfg)
         model.load_state_dict(torch.load(pth_path, map_location=device, weights_only=True))
         model.to(device).eval()
         S.update({"model": model, "cfg": cfg, "results": {}, "done": [], "cur": None, "vr": None, "model_source": "local"})
-        toggle_upd, toggle_html = _post_load_updates(cfg)
+        toggle_upd, toggle_html, infer_info = _post_load_updates(cfg)
         size_mb = os.path.getsize(pth_path) / 1024**2
         return (f"✅ Loaded local model!\n"
                 f"  File: {pth_name} ({size_mb:.1f} MB)\n"
@@ -161,10 +167,10 @@ def load_model_local(local_dir, pth_name):
                 f"  Backbone: {cfg['backbone']['name']} | Frames: {cfg['backbone']['num_frames']}\n"
                 f"  Classes ({len(cfg['class_names'])}): {cfg['class_names']}\n"
                 f"  Device: {device}",
-                toggle_upd, toggle_html)
+                toggle_upd, toggle_html, infer_info)
     except Exception as e:
         import traceback
-        return f"❌ Load failed: {e}\n\n{traceback.format_exc()}", U, ""
+        return f"❌ Load failed: {e}\n\n{traceback.format_exc()}", U, "", ""
 
 def scan_local_models(local_dir):
     if not local_dir or not os.path.isdir(local_dir):
@@ -267,7 +273,7 @@ def scan_videos_and_preview(vdir):
 
 # ====================== HTML Builders ======================
 
-def html_progress(vd, vt, cur_name, wd, wt, ws=None, elapsed=None):
+def html_progress(vd, vt, cur_name, wd, wt, ws=None, elapsed=None, total_frames=None):
     if vt == 0: return ""
     vp = (vd / vt) * 100; wp = (wd / max(wt, 1)) * 100
     vc = "#1D9E75" if vd == vt else "#D85A30"
@@ -275,8 +281,9 @@ def html_progress(vd, vt, cur_name, wd, wt, ws=None, elapsed=None):
     rate_str = ""
     if elapsed and elapsed > 0.1 and wd > 0:
         wps = wd / elapsed
-        if ws and ws > 0:
-            rate_str = f" · {wps:.1f} win/s · {wps*ws:.0f} frame/s"
+        if total_frames and total_frames > 0:
+            real_fps = total_frames / elapsed
+            rate_str = f" · {wps:.1f} win/s · {real_fps:.1f} fps"
         else:
             rate_str = f" · {wps:.1f} win/s"
     return f"""<div style="background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:10px 14px;">
@@ -507,6 +514,13 @@ def run_single(vf, num_workers, cache_local):
             infer_vdir = os.path.dirname(cached)
             yield "<p style='font-size:13px;color:#888;'>📦 Cached to local disk</p>", U, U, U, U, U, U, U, U
 
+    # Get total frames for fps calculation
+    try:
+        _vr = VideoReader(os.path.join(infer_vdir, vf), ctx=cpu(0))
+        vid_total_frames = len(_vr); del _vr
+    except:
+        vid_total_frames = None
+
     t0 = time.perf_counter()
     result = None
     for msg in infer_video_gen(infer_vdir, vf, S["model"], S["cfg"], S["disabled_classes"]):
@@ -517,7 +531,7 @@ def run_single(vf, num_workers, cache_local):
         if isinstance(msg, dict): result = msg
         else:
             wd, wt = msg
-            yield html_progress(0, 1, vf, wd, wt, ws=ws, elapsed=time.perf_counter()-t0), U, U, U, U, U, U, U, U
+            yield html_progress(0, 1, vf, wd, wt, ws=ws, elapsed=time.perf_counter()-t0, total_frames=vid_total_frames), U, U, U, U, U, U, U, U
     # Store result with original video path so frame preview works
     if result and cache_local:
         result["video_path"] = os.path.join(vdir, vf)
@@ -563,6 +577,12 @@ def run_batch(num_workers, cache_local):
             print(f"⛔ Batch inference cancelled at video {vi}/{total}")
             return
         infer_vdir = cache_map.get(vf, vdir)
+        # Get total frames for fps calculation
+        try:
+            _vr = VideoReader(os.path.join(infer_vdir, vf), ctx=cpu(0))
+            vid_total_frames = len(_vr); del _vr
+        except:
+            vid_total_frames = None
         t0 = time.perf_counter()
         result = None
         for msg in infer_video_gen(infer_vdir, vf, S["model"], S["cfg"], S["disabled_classes"]):
@@ -574,7 +594,7 @@ def run_batch(num_workers, cache_local):
             if isinstance(msg, dict): result = msg
             else:
                 wd, wt = msg
-                yield html_progress(vi, total, vf, wd, wt, ws=ws, elapsed=time.perf_counter()-t0), U, U, U, U, U, U, U, U, U
+                yield html_progress(vi, total, vf, wd, wt, ws=ws, elapsed=time.perf_counter()-t0, total_frames=vid_total_frames), U, U, U, U, U, U, U, U, U
         # Store with original path for frame preview
         if result and vf in cache_map:
             result["video_path"] = os.path.join(vdir, vf)
@@ -699,6 +719,7 @@ with gr.Blocks(title="Animal Behavior Inference", theme=GREEN_THEME) as demo:
             gr.Markdown("### ③ Inference")
             video_dd = gr.Dropdown(label="Select video", choices=[], interactive=True)
             with gr.Accordion("⚙️ Advanced settings", open=False):
+                infer_info_html = gr.HTML("<p style='color:#aaa;font-size:12px;'>Load a model to see window/stride settings</p>")
                 nw_in = gr.Slider(minimum=0, maximum=8, step=1, value=0,
                                   label="Num workers (data loading)",
                                   info="0 = main thread only. Windows: keep at 0 to avoid freezes.")
@@ -735,9 +756,9 @@ with gr.Blocks(title="Animal Behavior Inference", theme=GREEN_THEME) as demo:
             exp_log = gr.Textbox(label="Export log", interactive=False, lines=6)
 
     demo.load(list_models, [repo_in], [hf_model_dd, model_st])
-    hf_load_btn.click(load_model_hf, [repo_in, hf_model_dd], [model_st, behavior_toggles, toggle_label_html])
+    hf_load_btn.click(load_model_hf, [repo_in, hf_model_dd], [model_st, behavior_toggles, toggle_label_html, infer_info_html])
     local_scan_btn.click(scan_local_models, [local_dir_in], [local_model_dd, model_st])
-    local_load_btn.click(load_model_local, [local_dir_in, local_model_dd], [model_st, behavior_toggles, toggle_label_html])
+    local_load_btn.click(load_model_local, [local_dir_in, local_model_dd], [model_st, behavior_toggles, toggle_label_html, infer_info_html])
     behavior_toggles.change(on_toggle_change, [behavior_toggles], [toggle_status])
 
     # Shared outputs for demo/load folder: video dropdown, status, preview frame, info, scrubber, timeline, cursor
