@@ -1110,17 +1110,18 @@ def on_val_ratio_change(val_pct, val_seed):
 
 # ====================== Progress + Validation HTML ======================
 
-def html_progress(ep_done,ep_total,win_done,win_total,phase="training",ws=None,elapsed=None):
+def html_progress(ep_done,ep_total,win_done,win_total,phase="training",ws=None,elapsed=None,total_frames=None):
     if ep_total==0: return ""
     ep_pct=(ep_done/ep_total)*100; wp=(win_done/max(win_total,1))*100
     ec="#1D9E75" if ep_done==ep_total else "#D85A30"
     st="✅ Complete" if ep_done==ep_total else "Training..."
-    # Throughput: windows/sec and frames/sec (= win/s × window_size)
+    # Throughput: windows/sec and real fps (= total_frames / elapsed)
     rate_str=""
     if elapsed and elapsed>0.1 and win_done>0:
         wps=win_done/elapsed
-        if ws and ws>0:
-            rate_str=f" · {wps:.1f} win/s · {wps*ws:.0f} frame/s"
+        if total_frames and total_frames>0:
+            real_fps=total_frames/elapsed
+            rate_str=f" · {wps:.1f} win/s · {real_fps:.1f} fps"
         else:
             rate_str=f" · {wps:.1f} win/s"
     return f"<div style='background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:10px 14px;'><div style='display:flex;justify-content:space-between;margin-bottom:4px;'><span style='font-size:13px;font-weight:500;'>Epoch — {st}</span><span style='font-size:12px;color:#888;'>{ep_done}/{ep_total} epochs</span></div><div style='height:8px;background:#eee;border-radius:4px;overflow:hidden;margin-bottom:10px;'><div style='width:{ep_pct:.1f}%;height:100%;background:{ec};border-radius:4px;transition:width 0.3s;'></div></div><div style='display:flex;justify-content:space-between;margin-bottom:4px;'><span style='font-size:12px;font-weight:500;'>Epoch {min(ep_done+1,ep_total)} — {phase}</span><span style='font-size:12px;color:#888;'>{win_done}/{win_total} windows{rate_str}</span></div><div style='height:6px;background:#eee;border-radius:3px;overflow:hidden;'><div style='width:{wp:.1f}%;height:100%;background:#1D9E75;border-radius:3px;transition:width 0.15s;'></div></div></div>"
@@ -1313,6 +1314,8 @@ def run_training(repo,mname,vdir,ldir,odir,head_mode,
     val_loader = DataLoader(val_ds, batch_sz, shuffle=False, num_workers=num_workers,
                             pin_memory=True) if val_ds and len(val_ds) > 0 else None
     total_win=len(train_ds)
+    train_total_frames=sum(data[i]["T"] for i in tidx)
+    val_total_frames=sum(data[i]["T"] for i in vidx) if vidx else 0
 
     optimizer=optim.AdamW(model.parameters(),lr=lr,weight_decay=0.01)
     scheduler=CosineAnnealingLR(optimizer,T_max=n_epochs)
@@ -1338,7 +1341,7 @@ def run_training(repo,mname,vdir,ldir,odir,head_mode,
             rl+=loss.item()*accum*vids.size(0)
             if (bi+1)%5==0 or bi==nb-1:
                 wd=min((bi+1)*batch_sz,total_win)
-                yield html_progress(ep,n_epochs,wd,total_win,"training",ws=ws,elapsed=time.perf_counter()-ep_t0),U
+                yield html_progress(ep,n_epochs,wd,total_win,"training",ws=ws,elapsed=time.perf_counter()-ep_t0,total_frames=train_total_frames),U
 
         scheduler.step(); ep_loss=rl/len(train_ds)
         f1m=0; mAP=0; f1p=[]; app=[]; precp=[]; recp=[]
@@ -1356,7 +1359,7 @@ def run_training(repo,mname,vdir,ldir,odir,head_mode,
                     apr_.extend(pr.detach().cpu().numpy())
                     if (vi+1)%5==0 or vi==nb_val-1:
                         vd=min((vi+1)*batch_sz,val_total)
-                        yield html_progress(ep,n_epochs,vd,val_total,"validating",ws=ws,elapsed=time.perf_counter()-val_t0),U
+                        yield html_progress(ep,n_epochs,vd,val_total,"validating",ws=ws,elapsed=time.perf_counter()-val_t0,total_frames=val_total_frames),U
             f1p=f1_score(al_,ap_,average=None,labels=list(range(new_nc)),zero_division=0).tolist()
             f1m=f1_score(al_,ap_,average="macro",zero_division=0)
             precp=precision_score(al_,ap_,average=None,labels=list(range(new_nc)),zero_division=0).tolist()
@@ -1422,7 +1425,7 @@ def run_training(repo,mname,vdir,ldir,odir,head_mode,
         with open(cfg_path, "w") as f: json.dump(cfg_out, f, indent=2)
 
         S["train_log"].append({"epoch":ep+1,"loss":ep_loss,"f1":f1m,"mAP":mAP,"f1_per":f1p,"ap_per":app,"prec_per":precp,"rec_per":recp,"path":mp,"config_path":cfg_path})
-        yield html_progress(ep+1,n_epochs,total_win,total_win,"done",ws=ws),build_val_html(S["train_log"],new_names)
+        yield html_progress(ep+1,n_epochs,total_win,total_win,"done",ws=ws,total_frames=train_total_frames),build_val_html(S["train_log"],new_names)
 
     with open(os.path.join(odir,"training_log.json"),"w") as f: json.dump(S["train_log"],f,indent=2)
     print("✅ Training complete!")
