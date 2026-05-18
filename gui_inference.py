@@ -699,20 +699,6 @@ with gr.Blocks(title="Animal Behavior Inference", theme=GREEN_THEME) as demo:
             demo_btn = gr.Button("🎯 Load Demo", variant="secondary", size="sm")
             load_folder_btn = gr.Button("📂 Load folder", variant="secondary")
             scan_st = gr.Textbox(label="Folder status", interactive=False, lines=1)
-            gr.Markdown("---")
-            gr.Markdown("### ③ Inference")
-            video_dd = gr.Dropdown(label="Select video", choices=[], interactive=True)
-            with gr.Accordion("⚙️ Advanced settings", open=False):
-                infer_info_html = gr.HTML("<p style='color:#aaa;font-size:12px;'>Load a model to see window/stride settings</p>")
-                nw_in = gr.Slider(minimum=0, maximum=8, step=1, value=0,
-                                  label="Num workers (data loading)",
-                                  info="0 = main thread only. Windows: keep at 0 to avoid freezes.")
-                cache_local_cb = gr.Checkbox(label="Cache videos to local disk before inference", value=False,
-                                             info="Copies videos to local SSD first. Useful when reading from network/Drive.")
-            batch_btn = gr.Button("📦 Batch inference (all videos)", variant="primary", size="lg")
-            batch_log_tb = gr.Textbox(label="Batch log", interactive=False, lines=8)
-            run_btn = gr.Button("🚀 Run inference (single)", variant="secondary")
-            cancel_btn = gr.Button("⛔ Cancel inference", variant="stop")
 
         with gr.Column(scale=2, min_width=400):
             toggle_label_html = gr.HTML("<p style='color:#aaa;font-size:13px;'>Load a model to see behaviors</p>")
@@ -731,6 +717,20 @@ with gr.Blocks(title="Animal Behavior Inference", theme=GREEN_THEME) as demo:
             behavior_html = gr.HTML("<p style='color:#aaa;'>Run inference to see statistics</p>")
 
         with gr.Column(scale=1, min_width=260):
+            gr.Markdown("### ③ Inference")
+            video_dd = gr.Dropdown(label="Select video", choices=[], interactive=True)
+            with gr.Accordion("⚙️ Advanced settings", open=False):
+                infer_info_html = gr.HTML("<p style='color:#aaa;font-size:12px;'>Load a model to see window/stride settings</p>")
+                nw_in = gr.Slider(minimum=0, maximum=8, step=1, value=0,
+                                  label="Num workers (data loading)",
+                                  info="0 = main thread only. Windows: keep at 0 to avoid freezes.")
+                cache_local_cb = gr.Checkbox(label="Cache videos to local disk before inference", value=False,
+                                             info="Copies videos to local SSD first. Useful when reading from network/Drive.")
+            batch_btn = gr.Button("📦 Batch inference (all videos)", variant="primary", size="lg")
+            batch_log_tb = gr.Textbox(label="Batch log", interactive=False, lines=6)
+            run_btn = gr.Button("🚀 Run inference (single)", variant="secondary")
+            cancel_btn = gr.Button("⛔ Cancel inference", variant="stop")
+            gr.Markdown("---")
             gr.Markdown("### ④ Export")
             exp_fmt = gr.Dropdown(label="Output format", choices=["One-hot CSV (per-frame)", "BORIS event log"], value="One-hot CSV (per-frame)", interactive=True)
             exp_prev = gr.HTML("<p style='color:#aaa;font-size:13px;'>Run inference first</p>")
