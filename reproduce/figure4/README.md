@@ -8,12 +8,12 @@ Extension of the base Video Swin-T / TimeSformer pipeline with **video-level sub
 pip install torch torchvision transformers decord numpy pandas scikit-learn matplotlib seaborn tqdm
 ```
 
-## New Arguments
+## Arguments
 
 | Argument | Default | Description |
 |---|---|---|
 | `--train_data_ratio` | `1.0` | Fraction of training videos to use (0.0–1.0) |
-| `--video_split_seed` | `42` | RNG seed for video selection (vary across runs) |
+| `--video_split_seed` | `42` | RNG seed for video selection (42，123，999) |
 
 All other arguments are identical to the base scripts — see the base README.
 
