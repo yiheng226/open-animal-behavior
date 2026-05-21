@@ -17,22 +17,6 @@ Default selected (5 classes):
 
 Two additional classes (`Self-groom`, `Chasing`) are defined but excluded by default. Modify `--selected_behaviors` to include them.
 
-## Repository Structure
-
-```
-├── train_swin3d.py          # Train Video Swin-T
-├── eval_swin3d.py           # Evaluate Video Swin-T
-├── train_timesformer.py     # Train TimeSformer (ViT-Base)
-├── eval_timesformer.py      # Evaluate TimeSformer (ViT-Base)
-├── requirements.txt
-├── README.md
-└── data/                    # (not included — see below)
-    ├── videos/
-    │   ├── 1/               # Fold 1 videos (.mp4)
-    │   ├── 2/               # Fold 2 videos
-    │   └── 3/               # Fold 3 videos
-    └── labels/              # Per-video CSVs (one-hot, 7 columns)
-```
 
 ## Data & Trained Models
 
