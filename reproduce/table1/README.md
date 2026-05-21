@@ -87,7 +87,7 @@ python train_timesformer.py --test_folds 2 --train_folds 1 3
 python train_timesformer.py --test_folds 3 --train_folds 1 2
 
 # Data efficiency analysis (e.g. train on 60% of data)
-python train_timesformer.py --train_data_ratio 0.6
+
 ```
 
 ### Key Training Arguments
@@ -104,7 +104,6 @@ python train_timesformer.py --train_data_ratio 0.6
 | `--mlp_dropout` | `0.3` | `0.3` | MLP head dropout |
 | `--model_save_dir` | `checkpoints/swin3d` | `checkpoints/timesformer` | Output directory |
 | `--use_class_weights` | off | off | Enable inverse-frequency weighting |
-| `--train_data_ratio` | — | `1.0` | Fraction of training data (TimeSformer only) |
 | `--hf_model` | — | `facebook/timesformer-base-finetuned-k400` | HuggingFace model name (TimeSformer only) |
 
 ## Evaluation
