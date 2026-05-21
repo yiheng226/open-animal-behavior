@@ -71,7 +71,7 @@ python train_timesformer.py --test_folds 2 --train_folds 1 3
 python train_timesformer.py --test_folds 3 --train_folds 1 2
 
 # Custom paths
-python train_swin3d.py --base_video_dir /path/to/videos --label_dir /path/to/labels
+python train_timesformer.py --base_video_dir /path/to/videos --label_dir /path/to/labels
 ```
 
 ### Key Training Arguments
