@@ -9,6 +9,11 @@
 
 Both models use an identical MLP classification head for fair comparison.
 
+Due to GPU nondeterminism, mixed precision training, and multi-worker data loading, retraining the model may produce slightly different results across runs even with the same random seed.
+
+To ensure exact reproducibility of the reported metrics, we can provide the pretrained model checkpoints used in the paper upon request.
+
+
 ## Behavior Classes
 
 Default selected (5 classes):
