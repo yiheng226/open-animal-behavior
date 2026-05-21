@@ -33,10 +33,16 @@ python train_swin3d_ratio.py --test_folds 1 --train_folds 3 2 --train_data_ratio
 python train_swin3d_ratio.py --test_folds 2 --train_folds 1 3 --train_data_ratio 0.5 --video_split_seed 42
 python train_swin3d_ratio.py --test_folds 3 --train_folds 1 2 --train_data_ratio 0.5 --video_split_seed 42
 
+# Custom paths
+python train_swin3d.py --base_video_dir /path/to/videos --label_dir /path/to/labels
+
 # TimeSformer — 50% of training videos, 3-fold CV
 python train_timesformer_ratio.py --test_folds 1 --train_folds 3 2 --train_data_ratio 0.5 --video_split_seed 42
 python train_timesformer_ratio.py --test_folds 2 --train_folds 1 3 --train_data_ratio 0.5 --video_split_seed 42
 python train_timesformer_ratio.py --test_folds 3 --train_folds 1 2 --train_data_ratio 0.5 --video_split_seed 42
+
+# Custom paths
+python train_swin3d.py --base_video_dir /path/to/videos --label_dir /path/to/labels
 ```
 
 ## Evaluation
